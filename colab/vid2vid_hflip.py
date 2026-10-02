@@ -2,7 +2,7 @@
 #  Vid2Vid restyle для Google Colab (GPU T4) — ОДНА ЯЧЕЙКА, просто запусти.
 #  Drive: Мой диск/Colab Notebooks/content/input_videos  ->  .../output_iphone
 #  Пайплайн: HFLIP -> SD1.5 img2img + ControlNet Tile (лёгкая перерисовка текстур)
-#            -> временное сглаживание ГОТОВЫХ кадров по оптическому потоку
+#            -> антидрожание: сглаживание по времени только изменений нейросети (по оптическому потоку)
 #            -> полное разрешение + возврат мелких деталей оригинала (без мыла)
 #            -> сборка обратно в mp4 с оригинальным звуком
 # ==============================================================================
@@ -14,10 +14,11 @@ OUTPUT_DIR = f"{BASE_DIR}/output_iphone"
 
 PROMPT     = "photo of a person, natural skin texture, realistic, high quality, sharp focus"
 
-STRENGTH       = 0.22   # сила перерисовки: 0.15–0.30. Выше 0.3 — появляются выдуманные детали
+STRENGTH       = 0.20   # сила перерисовки: 0.15–0.30. Выше 0.3 — появляются выдуманные детали
 STEPS          = 20     # реально выполняется STEPS*STRENGTH ≈ 4 шага
 TILE_SCALE     = 1.00   # вес ControlNet Tile: держит детали (тату, текст, фон) на месте
-SMOOTH         = 0.15   # сглаживание мерцания: доля предыдущего готового кадра (0 = выкл, 0.3 макс)
+STABILITY      = 0.90   # антидрожание (0 = выкл, 0.95 = макс). Выше = меньше «плавания»
+SEED           = 42     # одинаковый шум на всех кадрах = меньше «плавания»
 DETAIL         = 1.00   # резкость: сколько мелких деталей вернуть с оригинала (0 = мыло, 1 = как в оригинале)
 SCENE_CUT_DIFF = 35.0   # порог смены сцены (на склейке сглаживание не применяется)
 SHORT_SIDE     = 512    # рабочее разрешение по КОРОТКОЙ стороне. 512 = родное для SD1.5 (448 = быстрее, хуже лица)
@@ -90,13 +91,15 @@ def has_audio(path):
         f'ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "{path}"', shell=True)
     return bool(out.strip())
 
-def warp(prev_img, cur_gray, prev_gray):
-    flow = cv2.calcOpticalFlowFarneback(cur_gray, prev_gray, None, 0.5, 3, 21, 3, 5, 1.2, 0)
+def flow_maps(cur_gray, prev_gray):
+    # Для каждого пикселя текущего кадра — где он был в предыдущем
+    flow = cv2.calcOpticalFlowFarneback(cur_gray, prev_gray, None, 0.5, 4, 21, 3, 5, 1.2, 0)
     h, w = cur_gray.shape
-    gx, gy = np.meshgrid(np.arange(w), np.arange(h))
-    mx = (gx + flow[..., 0]).astype(np.float32)
-    my = (gy + flow[..., 1]).astype(np.float32)
-    return cv2.remap(prev_img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    return gx + flow[..., 0], gy + flow[..., 1]
+
+def warp(img, maps):
+    return cv2.remap(img, maps[0], maps[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
 def process_video(src, dst):
     t0 = time.time()
@@ -121,7 +124,7 @@ def process_video(src, dst):
         sh(f'ffmpeg -v error {limit} -i "{src}" -vf "{base_vf}" "{tmp}/in/%06d.bmp"')
     frames = sorted(glob.glob(f"{tmp}/in/*.bmp"))
 
-    prev_gray = prev_out = None
+    prev_gray = prev_cur = prev_resid = None
     for i, fp in enumerate(tqdm(frames, desc=os.path.basename(src))):
         full = cv2.cvtColor(cv2.imread(fp), cv2.COLOR_BGR2RGB)
         cur = cv2.resize(full, (ww, wh), interpolation=cv2.INTER_AREA)
@@ -129,24 +132,31 @@ def process_video(src, dst):
         cur_pil = Image.fromarray(cur)
 
         # Каждый кадр генерируется ТОЛЬКО из оригинала (без подмешивания прошлых результатов),
-        # и шум свой на каждый кадр — так артефакты не копятся и не «прилипают» к экрану.
-        g = torch.Generator(DEV).manual_seed(i)
+        # поэтому артефакты не копятся и не «прилипают» к экрану.
+        g = torch.Generator(DEV).manual_seed(SEED)
         out = pipe(
             prompt=PROMPT, image=cur_pil, control_image=cur_pil,
             strength=STRENGTH, num_inference_steps=STEPS, guidance_scale=1.0,
             controlnet_conditioning_scale=TILE_SCALE, generator=g,
         ).images[0]
-        out_np = np.array(out)
+        cur_f = cur.astype(np.float32)
 
-        # Сглаживание мерцания уже готовых кадров (сдвиг предыдущего по движению)
-        if SMOOTH > 0 and prev_out is not None and np.abs(cur_gray - prev_gray).mean() < SCENE_CUT_DIFF:
-            warped = warp(prev_out, cur_gray, prev_gray)
-            out_np = cv2.addWeighted(out_np, 1 - SMOOTH, warped, SMOOTH, 0)
-
-        prev_out, prev_gray = out_np, cur_gray
+        # Антидрожание. «Плавание» живёт только в разнице (нейросеть − оригинал), сам оригинал стабилен.
+        # Сглаживаем по времени именно эту разницу, сдвигая прошлую по движению (оптический поток).
+        # Там, где поток ошибается (быстрое движение, руки перекрывают лицо), сглаживание ослабевает —
+        # поэтому шлейфов нет: основа кадра всегда берётся из текущего оригинала.
+        resid = np.array(out).astype(np.float32) - cur_f
+        if STABILITY > 0 and prev_resid is not None and np.abs(cur_gray - prev_gray).mean() < SCENE_CUT_DIFF:
+            maps = flow_maps(cur_gray, prev_gray)
+            err = np.abs(warp(prev_cur, maps) - cur_f).mean(axis=2)
+            conf = cv2.GaussianBlur(np.exp(-err / 20.0), (0, 0), 2)[..., None]
+            w = STABILITY * conf
+            resid = w * warp(prev_resid, maps) + (1 - w) * resid
+        prev_resid, prev_cur, prev_gray = resid, cur_f, cur_gray
+        out_np = np.clip(cur_f + resid, 0, 255)
 
         # Обратно в полное разрешение + мелкие детали оригинала (ресницы, волосы, кожа) — без мыла
-        big = cv2.resize(out_np, (W, H), interpolation=cv2.INTER_LANCZOS4).astype(np.float32)
+        big = cv2.resize(out_np, (W, H), interpolation=cv2.INTER_LANCZOS4)
         f32 = full.astype(np.float32)
         hi = f32 - cv2.GaussianBlur(f32, (0, 0), sigma)
         final = np.clip(big + DETAIL * hi, 0, 255).astype(np.uint8)
