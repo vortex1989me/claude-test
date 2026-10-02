@@ -7,23 +7,11 @@ new.py — уникализация видео через FFmpeg.
   input_videos/   <- сюда кладём исходные видео
   output_videos/  <- сюда попадают уникализированные копии
 
-Что меняется (каждая копия получает свой набор случайных параметров из seed):
-  * Визуал (pHash)      — микро-кроп, микро-поворот, цвет/гамма/оттенок, шум, резкость,
-                           виньетка, опционально зеркало; расстояние pHash измеряется.
-  * Файл (MD5/SHA-256)  — перекодирование, случайные параметры энкодера, чистка метаданных,
-                           удаление SEI с подписью x264/x265.
-  * Lanczos micro-scale — апскейл на 1–5 % с Lanczos + кроп обратно со случайным сдвигом.
-  * Custom AQ / CQM     — случайные aq-mode/aq-strength + своя матрица квантования (x264).
-  * Доп.: темп, тримминг, GOP, CRF/preset, аудио (питч/громкость/EQ/sample rate).
+Запуск: двойной клик по new.py или в консоли `python new.py`.
+Все настройки — в блоке «НАСТРОЙКИ» ниже. Меняете число, сохраняете файл, запускаете.
+Аргументы командной строки (python new.py --help) имеют приоритет над этим блоком.
 
-Требования: ffmpeg + ffprobe в PATH, Python 3.8+, numpy (для pHash; без него
-проверка pHash пропускается).
-
-Примеры:
-  python new.py                                  # все видео из input_videos -> output_videos
-  python new.py -n 5 --intensity high
-  python new.py -n 3 --min-phash 6 --seed 42
-  python new.py input_videos/clip.mp4 --codec h265 --dry-run
+Требования: ffmpeg + ffprobe в PATH, Python 3.9+, numpy (pip install numpy) для pHash.
 """
 
 from __future__ import annotations
@@ -48,33 +36,111 @@ try:
 except ImportError:  # pHash станет недоступен, остальное работает
     np = None
 
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                                 НАСТРОЙКИ                                    ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# Как читать диапазоны:  (мин, макс) — для каждой копии берётся случайное значение
+# внутри диапазона. Одиночное число X — случайное значение от -X до +X (в обе стороны).
+# 0 или (0, 0) — фильтр ВЫКЛЮЧЕН.
+
+# ---------------------------------------------------------------- основное
+COPIES = 1              # сколько уникальных копий делать из каждого видео
+LEVEL = "custom"        # "custom" — берутся значения из FILTERS ниже;
+                        # "low" / "medium" / "high" — готовые пресеты (см. PRESETS)
+STRENGTH = 1.0          # общий множитель силы всех фильтров: 0.5 = вдвое мягче, 2.0 = вдвое сильнее
+SEED = None             # None = каждый запуск разный; число (например 42) = одинаковый результат
+OUTPUT_FORMAT = None    # None = как у исходника; "mp4", "mov" или "mkv"
+MIN_PHASH = None        # None = не проверять; например 10 — если средний pHash (из 64) меньше,
+                        # копия переделывается с силой ×1.4 (до MAX_ATTEMPTS раз)
+MAX_ATTEMPTS = 3
+
+# ---------------------------------------------------------------- фильтры (LEVEL = "custom")
+FILTERS = dict(
+    # HFLIP — зеркальное отражение по горизонтали.
+    #   True  -> лево и право меняются местами. Самое сильное изменение pHash (≈25–35 из 64),
+    #            глазом почти незаметно, но зеркальным станет текст/надписи в кадре.
+    #   False -> без зеркала.
+    mirror=True,
+
+    # Lanczos micro-scaling: увеличение кадра и обрезка обратно в исходный размер.
+    #   (1.02, 1.04) -> приближение на 2–4 %, края срезаются. Меняет геометрию кадра для pHash.
+    #   (1.0, 1.0)   -> выключено.   Больше 1.08 — уже заметно «наехала» камера.
+    scale=(1.02, 1.04),
+
+    # Поворот кадра в градусах (±). 0.5 -> до ±0.5°. Масштаб сам подрастёт, чтобы не было
+    # чёрных углов. Больше 2° — заметно глазу. 0 = выкл.
+    rotate=0.5,
+
+    # Цвет. Значения ± от исходного:
+    brightness=0.02,    # яркость: 0.02 = ±2 %. Больше 0.06 — заметно светлее/темнее.
+    contrast=0.03,      # контраст: 0.03 = ±3 %.
+    saturation=0.06,    # насыщенность: 0.06 = ±6 %. Больше 0.15 — цвета «кислотные»/блёклые.
+    gamma=0.04,         # гамма (средние тона): 0.04 = ±4 %.
+    hue=2.5,            # оттенок в градусах: 2.5 = ±2.5°. Больше 8° — кожа меняет цвет.
+
+    # Шум (зерно), сила 0–100. (2, 5) -> лёгкое зерно, меняет каждый кадр и хеши.
+    #   Больше 10 — видно «песок», файл станет тяжелее. (0, 0) = выкл.
+    noise=(2, 5),
+
+    # Резкость (unsharp): 0.3 -> до +0.3. Больше 1.0 — ореолы по краям. 0 = выкл.
+    sharpen=0.3,
+
+    # Виньетка (затемнение углов): 0.15 -> очень мягкая. 0.5 — заметная. 0 = выкл.
+    vignette=0.15,
+
+    # Скорость: 0.02 = от 0.98× до 1.02× (видео и звук вместе, длительность ±2 %).
+    #   Больше 0.05 — заметно ускорено/замедлено. 0 = выкл.
+    speed=0.02,
+
+    # Срез кадров в начале и в конце: (1, 4) -> по 1–4 кадра с каждой стороны. (0, 0) = выкл.
+    trim_frames=(1, 4),
+
+    # Аудио:
+    audio_pitch=0.008,  # высота тона: 0.008 = ±0.8 % (≈±0.14 полутона, на слух не заметно).
+    volume=1.0,         # громкость в дБ: 1.0 = ±1 дБ.
+    eq_gain=2.0,        # эквалайзер: одна случайная полоса ±2 дБ. Меняет аудио-отпечаток.
+)
+
+# Готовые пресеты (используются при LEVEL = "low" / "medium" / "high"). Ключи — как в FILTERS.
+PRESETS = {
+    "low": dict(mirror=True, scale=(1.010, 1.020), rotate=0.0, brightness=0.010, contrast=0.015,
+                saturation=0.03, gamma=0.02, hue=1.0, noise=(1, 3), sharpen=0.15, vignette=0.0,
+                speed=0.010, trim_frames=(0, 2), audio_pitch=0.004, volume=0.5, eq_gain=1.0),
+    "medium": dict(FILTERS),
+    "high": dict(mirror=True, scale=(1.040, 1.070), rotate=1.2, brightness=0.035, contrast=0.050,
+                 saturation=0.10, gamma=0.07, hue=5.0, noise=(4, 8), sharpen=0.50, vignette=0.30,
+                 speed=0.035, trim_frames=(2, 8), audio_pitch=0.015, volume=1.5, eq_gain=3.0),
+}
+
+# ---------------------------------------------------------------- кодирование / железо
+# Настроено под: AMD Ryzen 5 2600 (6 ядер / 12 потоков), 8 ГБ ОЗУ, AMD Radeon R7 370.
+ENCODER = "cpu"         # "cpu" -> libx264 на процессоре. Все функции (своя матрица CQM, AQ,
+                        #          удаление подписи энкодера). Ryzen 5 2600: 1080p ≈ 1–2× realtime.
+                        # "amd" -> h264_amf на видеокарте (R7 370 = VCE 1.0). В 2–4 раза быстрее,
+                        #          но БЕЗ CQM/AQ и качество хуже. Нужен драйвер AMD с AMF.
+                        #          Если AMF не заработает, скрипт сам переключится на "cpu".
+CODEC = "h264"          # "h264" — рекомендуется. "h265" — файл меньше, но на Ryzen 2600
+                        #          в 3–5 раз медленнее; видеокарта R7 370 HEVC не умеет.
+CPU_THREADS = os.cpu_count() or 12   # потоки кодирования (на Ryzen 5 2600 = 12)
+PRESET = "medium"       # скорость x264: "fast" (быстрее, файл больше), "medium" (баланс),
+                        # "slow" (≈в 2 раза дольше, чуть лучше качество на тот же размер)
+CRF = (18, 22)          # качество: меньше = лучше и тяжелее. 18 — визуально без потерь,
+                        # 23 — по умолчанию x264, 26+ — заметна потеря качества
+USE_CQM = True          # своя матрица квантования (только ENCODER="cpu" и CODEC="h264")
+AQ_STRENGTH = (0.7, 1.3)  # сила адаптивной квантизации; aq-mode (1/2/3) выбирается случайно
+TONEMAP_HDR = True      # HDR-видео с iPhone (HLG/Dolby Vision) переводить в обычный SDR,
+                        # иначе цвета будут бледные/серые
+
+# ════════════════════════════════════════════════════════════════════════════════
+#              Ниже — код. Для обычной работы менять ничего не нужно.
+# ════════════════════════════════════════════════════════════════════════════════
+
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input_videos"
 OUTPUT_DIR = BASE_DIR / "output_videos"
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv", ".ts", ".wmv"}
-
-# Диапазоны изменений для каждого уровня интенсивности.
-INTENSITY = {
-    "low": dict(
-        scale=(1.010, 1.020), rotate=0.0, brightness=0.010, contrast=0.015,
-        saturation=0.03, gamma=0.02, hue=1.0, noise=(1, 3), sharpen=0.15,
-        vignette=0.0, speed=0.010, trim_frames=(0, 2), audio_pitch=0.004,
-        volume=0.5, eq_gain=1.0,
-    ),
-    "medium": dict(
-        scale=(1.020, 1.040), rotate=0.5, brightness=0.020, contrast=0.030,
-        saturation=0.06, gamma=0.04, hue=2.5, noise=(2, 5), sharpen=0.30,
-        vignette=0.15, speed=0.020, trim_frames=(1, 4), audio_pitch=0.008,
-        volume=1.0, eq_gain=2.0,
-    ),
-    "high": dict(
-        scale=(1.040, 1.070), rotate=1.2, brightness=0.035, contrast=0.050,
-        saturation=0.10, gamma=0.07, hue=5.0, noise=(4, 8), sharpen=0.50,
-        vignette=0.30, speed=0.035, trim_frames=(2, 8), audio_pitch=0.015,
-        volume=1.5, eq_gain=3.0,
-    ),
-}
 
 # JVT-матрицы по умолчанию (растровый порядок) — основа для пользовательской CQM.
 JVT_4X4_INTRA = [6, 13, 20, 28, 13, 20, 28, 32, 20, 28, 32, 37, 28, 32, 37, 42]
@@ -126,9 +192,22 @@ def probe(path: Path) -> dict:
     num, den = (video.get("avg_frame_rate") or video.get("r_frame_rate") or "30/1").split("/")
     fps = float(num) / float(den) if float(den) else 30.0
     duration = float(data["format"].get("duration") or video.get("duration") or 0)
+
+    # iPhone/Android пишут вертикальное видео как 1920x1080 + флаг поворота на 90°.
+    # ffmpeg при декодировании сам поворачивает кадр, поэтому ширину и высоту меняем местами.
+    rotation = 0
+    for sd in video.get("side_data_list", []):
+        if "rotation" in sd:
+            rotation = int(float(sd["rotation"]))
+    rotation = rotation or int(float(video.get("tags", {}).get("rotate", 0)))
+    w, h = int(video["width"]), int(video["height"])
+    if abs(rotation) % 180 == 90:
+        w, h = h, w
     return {
-        "width": int(video["width"]),
-        "height": int(video["height"]),
+        "width": w,
+        "height": h,
+        "rotation": rotation,
+        "hdr": video.get("color_transfer") in ("arib-std-b67", "smpte2084"),
         "fps": fps or 30.0,
         "duration": duration,
         "has_audio": audio is not None,
@@ -231,9 +310,13 @@ def rand_date(rng: random.Random) -> str:
     return stamp.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
 
 
+def filter_values(level: str) -> dict:
+    return dict(FILTERS) if level == "custom" else dict(PRESETS[level])
+
+
 def make_plan(info: dict, seed: int, intensity: str, strength: float, args) -> Plan:
     rng = random.Random(seed)
-    p = INTENSITY[intensity]
+    p = filter_values(intensity)
     s = strength
 
     def sym(r: float) -> float:
@@ -248,7 +331,7 @@ def make_plan(info: dict, seed: int, intensity: str, strength: float, args) -> P
     theta = math.radians(abs(plan.rotate_deg))
     w, h = info["width"], info["height"]
     rot_zoom = math.cos(theta) + math.sin(theta) * max(w / h, h / w)
-    base = 1 + (rng.uniform(*p["scale"]) - 1) * s
+    base = 1 + max(0.0, rng.uniform(*p["scale"]) - 1) * s
     plan.scale = round(base * rot_zoom, 5)
     sw, sh = even(w * plan.scale), even(h * plan.scale)
     # Кроп со сдвигом, но в пределах запаса, который остаётся после поворота.
@@ -256,14 +339,14 @@ def make_plan(info: dict, seed: int, intensity: str, strength: float, args) -> P
     my = max(0, (sh - h * rot_zoom) / 2)
     plan.crop_x = int((sw - w) / 2 + rng.uniform(-mx, mx))
     plan.crop_y = int((sh - h) / 2 + rng.uniform(-my, my))
-    plan.mirror = args.mirror
+    plan.mirror = p["mirror"] if args.mirror is None else args.mirror
 
     plan.brightness = round(sym(p["brightness"]), 4)
     plan.contrast = round(1 + sym(p["contrast"]), 4)
     plan.saturation = round(1 + sym(p["saturation"]), 4)
     plan.gamma = round(1 + sym(p["gamma"]), 4)
     plan.hue_deg = round(sym(p["hue"]), 3)
-    plan.noise = max(1, round(rng.randint(*p["noise"]) * s))
+    plan.noise = round(rng.randint(*p["noise"]) * s)
     plan.sharpen = round(rng.uniform(0.3, 1.0) * p["sharpen"] * s, 3)
     plan.vignette = round(rng.uniform(0.5, 1.0) * p["vignette"] * s, 3) if p["vignette"] else 0.0
 
@@ -282,10 +365,10 @@ def make_plan(info: dict, seed: int, intensity: str, strength: float, args) -> P
     plan.out_sample_rate = rng.choice([44100, 48000])
     plan.audio_bitrate = rng.choice(["128k", "144k", "160k", "192k"])
 
-    plan.crf = args.crf if args.crf is not None else rng.randint(18, 22)
-    plan.preset = rng.choice(["medium", "slow"]) if args.preset is None else args.preset
+    plan.crf = args.crf if args.crf is not None else rng.randint(*CRF)
+    plan.preset = args.preset or PRESET
     plan.aq_mode = rng.choice([1, 2, 3])
-    plan.aq_strength = round(rng.uniform(0.7, 1.3), 2)
+    plan.aq_strength = round(rng.uniform(*AQ_STRENGTH), 2)
     plan.psy_rd = f"{rng.uniform(0.8, 1.2):.2f},{rng.uniform(0.0, 0.2):.2f}"
     plan.deblock = f"{rng.randint(-2, 1)},{rng.randint(-2, 1)}"
     fps_round = max(1, round(info["fps"]))
@@ -294,7 +377,7 @@ def make_plan(info: dict, seed: int, intensity: str, strength: float, args) -> P
     plan.refs = rng.randint(2, 5)
     plan.me = rng.choice(["hex", "umh"])
     plan.subme = rng.randint(6, 9)
-    if args.codec == "h264" and not args.no_cqm:
+    if args.codec == "h264" and args.encoder == "cpu" and USE_CQM and not args.no_cqm:
         plan.cqm = make_cqm(rng, s)
 
     plan.meta = {
@@ -317,8 +400,14 @@ def build_filters(plan: Plan, info: dict) -> tuple[str, str]:
     sw, sh = even(w * plan.scale), even(h * plan.scale)
     lanczos = "lanczos+accurate_rnd+full_chroma_int+full_chroma_inp"
 
-    v = [f"setpts=(PTS-STARTPTS)/{plan.speed}"]
-    v.append(f"scale={sw}:{sh}:flags={lanczos}:param0=3")
+    v = []
+    if info["hdr"] and TONEMAP_HDR:
+        # HDR (HLG / PQ) -> SDR BT.709, иначе картинка бледная
+        v.append("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+                 "tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv")
+    v.append(f"setpts=(PTS-STARTPTS)/{plan.speed}")
+    if (sw, sh) != (w, h):
+        v.append(f"scale={sw}:{sh}:flags={lanczos}:param0=3")
     if plan.rotate_deg:
         v.append(f"rotate={plan.rotate_deg}*PI/180:ow=iw:oh=ih:bilinear=1:fillcolor=black")
     v.append(f"crop={w}:{h}:{plan.crop_x}:{plan.crop_y}")
@@ -366,9 +455,10 @@ def has_soxr() -> bool:
 
 
 def build_command(src: Path, dst: Path, plan: Plan, info: dict, codec: str,
-                  cqm_name: str | None) -> list:
+                  cqm_name: str | None, encoder: str = "cpu") -> list:
     vf, af = build_filters(plan, info)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y",
+           "-filter_threads", str(max(1, CPU_THREADS // 2))]
     if plan.trim_start:
         cmd += ["-ss", f"{plan.trim_start}"]
     cmd += ["-i", str(src)]
@@ -384,21 +474,32 @@ def build_command(src: Path, dst: Path, plan: Plan, info: dict, codec: str,
     common = (f"aq-mode={plan.aq_mode}:aq-strength={plan.aq_strength}"
               f":keyint={plan.keyint}:min-keyint={max(1, plan.keyint // 10)}"
               f":bframes={plan.bframes}:ref={plan.refs}:deblock={plan.deblock}")
-    if codec == "h264":
+    if encoder == "amd":
+        # AMD AMF (Radeon R7 370 = VCE 1.0): только H.264, без B-кадров, CQM и AQ
+        q = plan.crf + 1
+        cmd += ["-c:v", "h264_amf", "-usage", "transcoding", "-quality", "quality",
+                "-profile:v", "high", "-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q + 2),
+                "-g", str(plan.keyint), "-pix_fmt", "yuv420p"]
+        tag = []
+    elif codec == "h264":
         params = (f"{common}:psy-rd={plan.psy_rd}:me={plan.me}:subme={plan.subme}"
                   f":8x8dct=1:trellis=2")
         if cqm_name:
             params += f":cqmfile={cqm_name}"
-        cmd += ["-c:v", "libx264", "-profile:v", "high", "-x264-params", params,
+        cmd += ["-c:v", "libx264", "-profile:v", "high", "-threads", str(CPU_THREADS),
+                "-x264-params", params,
                 "-bsf:v", "filter_units=remove_types=6"]   # SEI с настройками x264
         tag = []
     else:
         psy = plan.psy_rd.split(",")[0]
         params = (f"{common}:psy-rd={psy}:me={plan.me}:subme={min(plan.subme, 7)}"
                   f":log-level=error:info=0")                # info=0: без SEI-подписи
-        cmd += ["-c:v", "libx265", "-x265-params", params]
+        cmd += ["-c:v", "libx265", "-threads", str(CPU_THREADS), "-x265-params", params]
         tag = ["-tag:v", "hvc1"]
-    cmd += ["-crf", str(plan.crf), "-preset", plan.preset, "-pix_fmt", "yuv420p"] + tag
+    if encoder != "amd":
+        cmd += ["-crf", str(plan.crf), "-preset", plan.preset, "-pix_fmt", "yuv420p"] + tag
+    if info["hdr"] and TONEMAP_HDR:
+        cmd += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
 
     m = plan.meta
     cmd += ["-map_metadata", "-1", "-map_chapters", "-1",
@@ -480,13 +581,23 @@ def process(src: Path, out_dir: Path, index: int, args, base_seed: int) -> dict:
             if plan.cqm:
                 cqm_name = "cqm.cfg"   # относительный путь: в x264-params нельзя ':' (C:\...)
                 write_cqm(plan.cqm, Path(tmp) / cqm_name)
-            cmd = build_command(src.resolve(), dst, plan, info, args.codec, cqm_name)
+            cmd = build_command(src.resolve(), dst, plan, info, args.codec, cqm_name, args.encoder)
             if args.dry_run:
                 log(" ".join(f'"{c}"' if " " in c or ";" in c else c for c in cmd))
                 return {"source": str(src), "plan": asdict(plan), "dry_run": True}
             log(f"[{src.name} #{index}] попытка {attempt}, seed={attempt_seed}, "
-                f"сила={strength:.2f}")
+                f"сила={strength:.2f}, {info['width']}x{info['height']}"
+                f"{', HDR->SDR' if info['hdr'] and TONEMAP_HDR else ''}, энкодер={args.encoder}")
             proc = subprocess.run(cmd, cwd=tmp)
+            if proc.returncode != 0 and args.encoder == "amd":
+                log("  AMD AMF не сработал (драйвер/видеокарта) — переключаюсь на процессор (cpu).")
+                args.encoder = "cpu"
+                plan = make_plan(info, attempt_seed, args.intensity, strength, args)
+                if plan.cqm:
+                    cqm_name = "cqm.cfg"
+                    write_cqm(plan.cqm, Path(tmp) / cqm_name)
+                cmd = build_command(src.resolve(), dst, plan, info, args.codec, cqm_name, "cpu")
+                proc = subprocess.run(cmd, cwd=tmp)
             if proc.returncode != 0:
                 raise RuntimeError(f"ffmpeg завершился с кодом {proc.returncode}")
 
@@ -524,7 +635,7 @@ def print_summary(r: dict) -> None:
         d = r["phash_distance"]
         log(f"     pHash Хэмминг: mean={d['mean']} min={d['min']} max={d['max']} (из 64)")
     log(f"     Lanczos x{p['scale']}  rot={p['rotate_deg']}°  crop=({p['crop_x']},{p['crop_y']})"
-        f"  speed={p['speed']}  CRF={p['crf']}  aq-mode={p['aq_mode']}"
+        f"  HFLIP={'да' if p['mirror'] else 'нет'}  speed={p['speed']}  CRF={p['crf']}  aq-mode={p['aq_mode']}"
         f"  aq-strength={p['aq_strength']}  CQM={'да' if p['cqm'] else 'нет'}")
 
 
@@ -535,26 +646,33 @@ def main() -> None:
                     help="видеофайл или папка (по умолчанию input_videos рядом со скриптом)")
     ap.add_argument("-o", "--output", type=Path, default=OUTPUT_DIR,
                     help="папка вывода (по умолчанию output_videos рядом со скриптом)")
-    ap.add_argument("-n", "--copies", type=int, default=1, help="копий на каждый исходник")
-    ap.add_argument("--intensity", choices=INTENSITY, default="medium")
-    ap.add_argument("--strength", type=float, default=1.0, help="множитель силы (0.5–2.0)")
-    ap.add_argument("--seed", type=int, help="seed для воспроизводимости")
-    ap.add_argument("--codec", choices=["h264", "h265"], default="h264")
-    ap.add_argument("--crf", type=int, help="фиксированный CRF (иначе 18–22)")
-    ap.add_argument("--preset", help="фиксированный preset x264/x265")
-    ap.add_argument("--format", help="расширение вывода: mp4, mkv, mov")
-    ap.add_argument("--mirror", action="store_true", help="зеркально отразить по горизонтали")
+    ap.add_argument("-n", "--copies", type=int, default=COPIES, help="копий на каждый исходник")
+    ap.add_argument("--intensity", choices=["custom", *PRESETS], default=LEVEL,
+                    help="custom = значения FILTERS из начала скрипта")
+    ap.add_argument("--strength", type=float, default=STRENGTH, help="множитель силы (0.5–2.0)")
+    ap.add_argument("--seed", type=int, default=SEED, help="seed для воспроизводимости")
+    ap.add_argument("--codec", choices=["h264", "h265"], default=CODEC)
+    ap.add_argument("--encoder", choices=["cpu", "amd"], default=ENCODER,
+                    help="cpu = libx264 (все функции), amd = h264_amf на видеокарте")
+    ap.add_argument("--crf", type=int, help=f"фиксированный CRF (иначе {CRF[0]}–{CRF[1]})")
+    ap.add_argument("--preset", help=f"preset x264/x265 (по умолчанию {PRESET})")
+    ap.add_argument("--format", default=OUTPUT_FORMAT, help="расширение вывода: mp4, mkv, mov")
+    ap.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=None,
+                    help="HFLIP: --mirror включить, --no-mirror выключить (иначе из FILTERS)")
     ap.add_argument("--keep-speed", action="store_true", help="не менять темп")
     ap.add_argument("--no-cqm", action="store_true", help="без пользовательской матрицы")
-    ap.add_argument("--min-phash", type=float,
+    ap.add_argument("--min-phash", type=float, default=MIN_PHASH,
                     help="минимальная средняя дистанция pHash; иначе повтор с усилением")
-    ap.add_argument("--max-attempts", type=int, default=3)
+    ap.add_argument("--max-attempts", type=int, default=MAX_ATTEMPTS)
     ap.add_argument("--no-verify", action="store_true", help="не считать pHash")
     ap.add_argument("--report", type=Path, help="сохранить JSON-отчёт")
     ap.add_argument("--dry-run", action="store_true", help="только показать команды ffmpeg")
     args = ap.parse_args()
 
     require_tools()
+    if args.encoder == "amd" and args.codec == "h265":
+        log("Radeon R7 370 не кодирует H.265 — используется процессор (cpu).")
+        args.encoder = "cpu"
     if np is None and not args.no_verify:
         log("Внимание: numpy не установлен — pHash не будет посчитан (pip install numpy).")
 

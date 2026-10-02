@@ -1,0 +1,5 @@
+input_videos/*
+!input_videos/.gitkeep
+output_videos/*
+!output_videos/.gitkeep
+__pycache__/
