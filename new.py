@@ -48,9 +48,13 @@ except ImportError:  # pHash станет недоступен, остально
 COPIES = 1              # сколько уникальных копий делать из каждого видео
 LEVEL = "custom"        # "custom" — берутся значения из FILTERS ниже;
                         # "low" / "medium" / "high" — готовые пресеты (см. PRESETS)
-STRENGTH = 1.0          # общий множитель силы всех фильтров: 0.5 = вдвое мягче, 2.0 = вдвое сильнее
+STRENGTH = 2.0          # общий множитель силы всех фильтров: 0.5 = вдвое мягче, 2.0 = вдвое сильнее.
+                        # Умножает ВСЁ в FILTERS (кроме mirror): при 2.0 scale (1.04, 1.06) даёт
+                        # приближение 8–12 %, rotate 0.7 -> до ±1.4°, hue 2.5 -> до ±5° и т. д.
 SEED = None             # None = каждый запуск разный; число (например 42) = одинаковый результат
-OUTPUT_FORMAT = None    # None = как у исходника; "mp4", "mov" или "mkv"
+OUTPUT_FORMAT = "mp4"   # "mp4", "mov", "mkv" или None (как у исходника).
+                        # Имя файла сохраняется: IMG_0205.MOV -> IMG_0205.mp4;
+                        # при COPIES > 1: IMG_0205.mp4, IMG_0205_2.mp4, IMG_0205_3.mp4 ...
 MIN_PHASH = None        # None = не проверять; например 10 — если средний pHash (из 64) меньше,
                         # копия переделывается с силой ×1.4 (до MAX_ATTEMPTS раз)
 MAX_ATTEMPTS = 3
@@ -66,11 +70,11 @@ FILTERS = dict(
     # Lanczos micro-scaling: увеличение кадра и обрезка обратно в исходный размер.
     #   (1.02, 1.04) -> приближение на 2–4 %, края срезаются. Меняет геометрию кадра для pHash.
     #   (1.0, 1.0)   -> выключено.   Больше 1.08 — уже заметно «наехала» камера.
-    scale=(1.02, 1.04),
+    scale=(1.04, 1.06),
 
     # Поворот кадра в градусах (±). 0.5 -> до ±0.5°. Масштаб сам подрастёт, чтобы не было
     # чёрных углов. Больше 2° — заметно глазу. 0 = выкл.
-    rotate=0.5,
+    rotate=0.7,
 
     # Цвет. Значения ± от исходного:
     brightness=0.02,    # яркость: 0.02 = ±2 %. Больше 0.06 — заметно светлее/темнее.
@@ -100,17 +104,52 @@ FILTERS = dict(
     audio_pitch=0.008,  # высота тона: 0.008 = ±0.8 % (≈±0.14 полутона, на слух не заметно).
     volume=1.0,         # громкость в дБ: 1.0 = ±1 дБ.
     eq_gain=2.0,        # эквалайзер: одна случайная полоса ±2 дБ. Меняет аудио-отпечаток.
+    # ---- Незаметные глазу изменения (добавлены; 0 или (0, 0) = выкл) ----
+
+    # Цветовая температура: сдвиг теплее/холоднее (красный против синего). 0.02 = ±2 %.
+    #   Глаз воспринимает как другой баланс белого. Больше 0.06 — кадр заметно жёлтый/синий.
+    color_temp=0.02,
+
+    # Линза (бочкообразная дисторсия): 0.01 -> центр чуть «выпуклый», края слегка сжаты.
+    #   Нелинейно меняет геометрию — хорошо сбивает pHash и нейросетевые отпечатки,
+    #   а глазу не видно. Больше 0.05 — эффект «рыбьего глаза». Чёрных углов нет.
+    lens=0.01,
+
+    # Дрейф камеры: кадр медленно «плавает» на N пикселей (период 6–12 с).
+    #   3 -> до ±3 px — как лёгкое дыхание при съёмке с рук. Каждый кадр смещён по-разному.
+    #   Больше 15 — заметно «качает». Ограничен запасом от scale.
+    drift=3,
+
+    # Выброс кадров: 1 кадр из каждых N заменяется предыдущим. (90, 150) -> 1 из 90–150
+    #   (при 30 fps — раз в 3–5 с). Ломает покадровое сравнение. Меньше 30 — видны рывки.
+    frame_drop=(90, 150),
+
+    # Шумоподавление (hqdn3d) ДО добавления своего зерна: убирает родной шум матрицы
+    #   камеры. 1.0 — едва заметно. Больше 4 — «пластиковая» кожа. 0 = выкл.
+    denoise=1.0,
+
+    # Фоновый шум в аудио (розовый), в дБ: -66 — не слышно, но меняет аудио-отпечаток
+    #   в тишине. -50 и громче — слышно шипение. 0 = выкл. (STRENGTH не влияет)
+    audio_noise=-66,
+
+    # Ширина стерео: 0.05 = ±5 %. Только для стерео-звука. 0 = выкл.
+    stereo=0.05,
 )
 
 # Готовые пресеты (используются при LEVEL = "low" / "medium" / "high"). Ключи — как в FILTERS.
 PRESETS = {
     "low": dict(mirror=True, scale=(1.010, 1.020), rotate=0.0, brightness=0.010, contrast=0.015,
                 saturation=0.03, gamma=0.02, hue=1.0, noise=(1, 3), sharpen=0.15, vignette=0.0,
-                speed=0.010, trim_frames=(0, 2), audio_pitch=0.004, volume=0.5, eq_gain=1.0),
-    "medium": dict(FILTERS),
+                speed=0.010, trim_frames=(0, 2), audio_pitch=0.004, volume=0.5, eq_gain=1.0,
+                color_temp=0.01, lens=0.005, drift=2, frame_drop=(150, 240), denoise=0.8, audio_noise=-66, stereo=0.03),
+    "medium": dict(mirror=True, scale=(1.020, 1.040), rotate=0.5, brightness=0.020, contrast=0.030,
+                   saturation=0.06, gamma=0.04, hue=2.5, noise=(2, 5), sharpen=0.30, vignette=0.15,
+                   speed=0.020, trim_frames=(1, 4), audio_pitch=0.008, volume=1.0, eq_gain=2.0,
+                   color_temp=0.02, lens=0.01, drift=3, frame_drop=(90, 150), denoise=1.0, audio_noise=-66, stereo=0.05),
     "high": dict(mirror=True, scale=(1.040, 1.070), rotate=1.2, brightness=0.035, contrast=0.050,
                  saturation=0.10, gamma=0.07, hue=5.0, noise=(4, 8), sharpen=0.50, vignette=0.30,
-                 speed=0.035, trim_frames=(2, 8), audio_pitch=0.015, volume=1.5, eq_gain=3.0),
+                 speed=0.035, trim_frames=(2, 8), audio_pitch=0.015, volume=1.5, eq_gain=3.0,
+                 color_temp=0.035, lens=0.02, drift=5, frame_drop=(60, 100), denoise=1.5, audio_noise=-66, stereo=0.08),
 }
 
 # ---------------------------------------------------------------- кодирование / железо
@@ -212,6 +251,7 @@ def probe(path: Path) -> dict:
         "duration": duration,
         "has_audio": audio is not None,
         "sample_rate": int(audio["sample_rate"]) if audio else 48000,
+        "channels": int(audio.get("channels", 2)) if audio else 0,
     }
 
 
@@ -241,6 +281,13 @@ class Plan:
     noise: int = 0
     sharpen: float = 0.0
     vignette: float = 0.0
+    color_temp: float = 0.0
+    lens_k1: float = 0.0
+    drift_amp: float = 0.0
+    drift_period: float = 8.0
+    frame_drop_n: int = 0
+    frame_drop_k: int = 0
+    denoise: float = 0.0
     # время
     speed: float = 1.0
     trim_start: float = 0.0
@@ -251,6 +298,8 @@ class Plan:
     eq_freq: int = 1000
     eq_gain: float = 0.0
     highpass: int = 20
+    audio_noise_db: float = 0.0
+    stereo: float = 1.0
     out_sample_rate: int = 48000
     audio_bitrate: str = "160k"
     # энкодер
@@ -337,6 +386,10 @@ def make_plan(info: dict, seed: int, intensity: str, strength: float, args) -> P
     # Кроп со сдвигом, но в пределах запаса, который остаётся после поворота.
     mx = max(0, (sw - w * rot_zoom) / 2)
     my = max(0, (sh - h * rot_zoom) / 2)
+    # Часть запаса оставляем под дрейф камеры.
+    plan.drift_amp = round(min(p.get("drift", 0) * s, 0.5 * min(mx, my)), 2)
+    plan.drift_period = round(rng.uniform(6, 12), 2)
+    mx, my = mx - plan.drift_amp, my - plan.drift_amp
     plan.crop_x = int((sw - w) / 2 + rng.uniform(-mx, mx))
     plan.crop_y = int((sh - h) / 2 + rng.uniform(-my, my))
     plan.mirror = p["mirror"] if args.mirror is None else args.mirror
@@ -349,6 +402,13 @@ def make_plan(info: dict, seed: int, intensity: str, strength: float, args) -> P
     plan.noise = round(rng.randint(*p["noise"]) * s)
     plan.sharpen = round(rng.uniform(0.3, 1.0) * p["sharpen"] * s, 3)
     plan.vignette = round(rng.uniform(0.5, 1.0) * p["vignette"] * s, 3) if p["vignette"] else 0.0
+    plan.color_temp = round(sym(p.get("color_temp", 0)), 4)
+    plan.lens_k1 = -round(rng.uniform(0.5, 1.0) * p.get("lens", 0) * s, 4)
+    plan.denoise = round(p.get("denoise", 0) * rng.uniform(0.8, 1.2), 2)
+    fd = p.get("frame_drop", (0, 0))
+    if fd and fd[1]:
+        plan.frame_drop_n = max(10, round(rng.randint(*fd) / max(1.0, s ** 0.5)))
+        plan.frame_drop_k = rng.randint(0, plan.frame_drop_n - 1)
 
     if not args.keep_speed:
         plan.speed = round(1 + sym(p["speed"]), 4)
@@ -362,6 +422,8 @@ def make_plan(info: dict, seed: int, intensity: str, strength: float, args) -> P
     plan.eq_freq = rng.choice([250, 500, 1000, 2000, 4000, 8000])
     plan.eq_gain = round(sym(p["eq_gain"]), 2)
     plan.highpass = rng.randint(18, 35)
+    plan.audio_noise_db = round(p.get("audio_noise", 0) + rng.uniform(-2, 2), 1) if p.get("audio_noise") else 0.0
+    plan.stereo = round(1 + sym(p.get("stereo", 0)), 3)
     plan.out_sample_rate = rng.choice([44100, 48000])
     plan.audio_bitrate = rng.choice(["128k", "144k", "160k", "192k"])
 
@@ -405,16 +467,32 @@ def build_filters(plan: Plan, info: dict) -> tuple[str, str]:
         # HDR (HLG / PQ) -> SDR BT.709, иначе картинка бледная
         v.append("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
                  "tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv")
+    if plan.frame_drop_n:
+        # кадр выбрасывается, при выводе в постоянный FPS на его место встаёт предыдущий
+        v.append(f"select='not(eq(mod(n,{plan.frame_drop_n}),{plan.frame_drop_k}))'")
     v.append(f"setpts=(PTS-STARTPTS)/{plan.speed}")
+    if plan.denoise:
+        d = plan.denoise
+        v.append(f"hqdn3d={d}:{d * 0.75:.2f}:{d * 1.5:.2f}:{d * 1.1:.2f}")
+    if plan.lens_k1:
+        v.append(f"lenscorrection=k1={plan.lens_k1}:k2={plan.lens_k1 / 2:.4f}:i=bilinear")
     if (sw, sh) != (w, h):
         v.append(f"scale={sw}:{sh}:flags={lanczos}:param0=3")
     if plan.rotate_deg:
         v.append(f"rotate={plan.rotate_deg}*PI/180:ow=iw:oh=ih:bilinear=1:fillcolor=black")
-    v.append(f"crop={w}:{h}:{plan.crop_x}:{plan.crop_y}")
+    if plan.drift_amp:
+        a, T = plan.drift_amp, plan.drift_period
+        v.append(f"crop={w}:{h}:'{plan.crop_x}+{a}*sin(2*PI*t/{T})'"
+                 f":'{plan.crop_y}+{a}*cos(2*PI*t/{T * 1.37:.2f})'")
+    else:
+        v.append(f"crop={w}:{h}:{plan.crop_x}:{plan.crop_y}")
     if plan.mirror:
         v.append("hflip")
     v.append(f"eq=brightness={plan.brightness}:contrast={plan.contrast}"
              f":saturation={plan.saturation}:gamma={plan.gamma}")
+    if plan.color_temp:
+        c = plan.color_temp
+        v.append(f"colorbalance=rm={c}:bm={-c}:rh={c / 2:.4f}:bh={-c / 2:.4f}")
     if plan.hue_deg:
         v.append(f"hue=h={plan.hue_deg}")
     if plan.sharpen:
@@ -436,6 +514,7 @@ def build_filters(plan: Plan, info: dict) -> tuple[str, str]:
         f"highpass=f={plan.highpass}",
         f"equalizer=f={plan.eq_freq}:t=q:w=1.0:g={plan.eq_gain}",
         f"volume={plan.volume_db}dB",
+        *( [f"extrastereo=m={plan.stereo}"] if info.get("channels") == 2 and plan.stereo != 1 else [] ),
         f"aresample={plan.out_sample_rate}:resampler=soxr" if has_soxr() else
         f"aresample={plan.out_sample_rate}",
     ]
@@ -467,7 +546,16 @@ def build_command(src: Path, dst: Path, plan: Plan, info: dict, codec: str,
         cmd += ["-t", f"{kept / plan.speed:.4f}"]
 
     cmd += ["-map", "0:v:0", "-vf", vf]
-    if info["has_audio"]:
+    if info["has_audio"] and plan.audio_noise_db:
+        amp = 10 ** (plan.audio_noise_db / 20)
+        layout = "stereo" if info["channels"] == 2 else "mono"
+        fc = (f"[0:a:0]{af}[a0];"
+              f"anoisesrc=c=pink:r={plan.out_sample_rate}:a={amp:.6f}:seed={plan.seed % 100000},"
+              f"aformat=channel_layouts={layout}[an];"
+              f"[a0][an]amix=inputs=2:duration=first:normalize=0[aout]")
+        cmd += ["-filter_complex", fc, "-map", "[aout]", "-ac", str(info["channels"] or 2),
+                "-c:a", "aac", "-b:a", plan.audio_bitrate, "-ar", str(plan.out_sample_rate)]
+    elif info["has_audio"]:
         cmd += ["-map", "0:a:0", "-af", af,
                 "-c:a", "aac", "-b:a", plan.audio_bitrate, "-ar", str(plan.out_sample_rate)]
 
@@ -569,7 +657,8 @@ def process(src: Path, out_dir: Path, index: int, args, base_seed: int) -> dict:
     ext = args.format or src.suffix.lower() or ".mp4"
     if not ext.startswith("."):
         ext = "." + ext
-    dst = (out_dir / f"{src.stem}_uniq_{index:02d}{ext}").resolve()
+    name = src.stem if index == 1 else f"{src.stem}_{index}"
+    dst = (out_dir / f"{name}{ext}").resolve()
 
     strength = args.strength
     attempt_seed = base_seed
