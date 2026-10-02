@@ -27,6 +27,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -143,6 +145,18 @@ FILTERS = dict(
     blur_border=(0.92, 0.95),
     blur_amount=20,     # сила размытия фона: 10 — мягко, 20 — норм, 40 — сплошное пятно
     blur_dim=0.05,      # затемнение фона: 0.05 = на 5 % темнее, чтобы видео выделялось
+
+    # ---- Движущиеся полупрозрачные элементы поверх видео (STRENGTH не влияет) ----
+    # Пыль: мелкие светлые/тёмные пылинки, мерцают каждый кадр, как на плёнке.
+    #   (6, 14) -> 6–14 пылинок в кадре.  (20, 40) — заметно «грязно».  (0, 0) = выкл.
+    dust=(6, 14),
+    dust_strength=35,   # яркость пылинок: 20 — едва видно, 35 — норм, 70 — явно
+    # Световой блик (light leak): мягкое тёплое пятно медленно плывёт по кадру.
+    #   0.08 — едва заметное тепло, 0.12 — как блик от окна, 0.25 — явный эффект. 0 = выкл.
+    light_leak=0.10,
+    # Тепловое марево (heat haze): картинка слегка «дрожит» волнами.
+    #   1.0 -> сдвиг до 1 px — глазом почти не видно. 3 — как над асфальтом. 0 = выкл.
+    heat_haze=1.0,
 )
 
 # ---------------------------------------------------------------- готовые наборы
@@ -177,6 +191,10 @@ PRESETS = {
         eq_gain=1.0,
         audio_noise=-66,
         stereo=0.03,
+        dust=(3, 8),
+        dust_strength=25,
+        light_leak=0.06,
+        heat_haze=0.0,
     ),
     "medium": dict(   # баланс
         mirror=True,
@@ -205,6 +223,10 @@ PRESETS = {
         eq_gain=2.0,
         audio_noise=-66,
         stereo=0.05,
+        dust=(6, 14),
+        dust_strength=35,
+        light_leak=0.10,
+        heat_haze=1.0,
     ),
     "high": dict(   # сильно, но ещё естественно
         mirror=True,
@@ -233,6 +255,10 @@ PRESETS = {
         eq_gain=3.0,
         audio_noise=-66,
         stereo=0.08,
+        dust=(10, 20),
+        dust_strength=45,
+        light_leak=0.15,
+        heat_haze=1.5,
     ),
 }
 
@@ -252,6 +278,8 @@ CRF = (18, 22)          # качество: меньше = лучше и тяж�
                         # 23 — по умолчанию x264, 26+ — заметна потеря качества
 USE_CQM = True          # своя матрица квантования (только ENCODER="cpu" и CODEC="h264")
 AQ_STRENGTH = (0.7, 1.3)  # сила адаптивной квантизации; aq-mode (1/2/3) выбирается случайно
+STALL_TIMEOUT = 60      # сторож: если ffmpeg N секунд не выдаёт новых кадров, он считается
+                        # зависшим — процесс убивается и запускается более простой режим
 TONEMAP_HDR = True      # HDR-видео с iPhone (HLG/Dolby Vision) переводить в обычный SDR,
                         # иначе цвета будут бледные/серые
 
@@ -306,7 +334,8 @@ def file_hashes(path: Path) -> dict:
 def probe(path: Path) -> dict:
     cmd = ["ffprobe", "-v", "error", "-print_format", "json",
            "-show_format", "-show_streams", str(path)]
-    data = json.loads(subprocess.run(cmd, capture_output=True, check=True, text=True).stdout)
+    data = json.loads(subprocess.run(cmd, capture_output=True, check=True, text=True,
+                                     stdin=subprocess.DEVNULL, timeout=60).stdout)
     video = next((s for s in data["streams"] if s["codec_type"] == "video"), None)
     if video is None:
         raise ValueError(f"{path}: нет видеопотока")
@@ -392,6 +421,12 @@ class Plan:
     border_y: int = 0
     blur_amount: int = 20
     blur_dim: float = 0.0
+    dust_count: int = 0
+    dust_amp: int = 35
+    leak: float = 0.0
+    leak_params: list = field(default_factory=list)
+    haze: float = 0.0
+    haze_params: list = field(default_factory=list)
     out_sample_rate: int = 48000
     audio_bitrate: str = "160k"
     # энкодер
@@ -526,6 +561,22 @@ def make_plan(info: dict, seed: int, intensity: str, strength: float, args) -> P
         plan.border_y = int((h - fh) / 2 + rng.uniform(-0.3, 0.3) * (h - fh) / 2)
         plan.blur_amount = int(p.get("blur_amount", 20))
         plan.blur_dim = float(p.get("blur_dim", 0.0))
+
+    dc = p.get("dust", (0, 0))
+    if dc and dc[1]:
+        plan.dust_count = rng.randint(*dc)
+        plan.dust_amp = int(p.get("dust_strength", 35))
+    if p.get("light_leak"):
+        plan.leak = round(p["light_leak"] * rng.uniform(0.8, 1.2), 3)
+        # периоды движения по X/Y и «дыхания» яркости, фазы, радиус пятна
+        plan.leak_params = [round(rng.uniform(9, 16), 2), round(rng.uniform(11, 19), 2),
+                            round(rng.uniform(4, 7), 2), round(rng.uniform(0, 6.28), 2),
+                            round(rng.uniform(0, 6.28), 2), round(rng.uniform(0.22, 0.32), 3)]
+    if p.get("heat_haze"):
+        plan.haze = round(p["heat_haze"] * rng.uniform(0.8, 1.2), 2)
+        # число волн по вертикали/горизонтали и скорость подъёма волн
+        plan.haze_params = [round(rng.uniform(6, 10), 2), round(rng.uniform(3, 6), 2),
+                            round(rng.uniform(0.3, 0.6), 2)]
     plan.out_sample_rate = rng.choice([44100, 48000])
     plan.audio_bitrate = rng.choice(["128k", "144k", "160k", "192k"])
 
@@ -559,7 +610,59 @@ def make_plan(info: dict, seed: int, intensity: str, strength: float, args) -> P
 
 # --------------------------------------------------------------------------- ffmpeg
 
-def build_filters(plan: Plan, info: dict) -> tuple[str, str]:
+# Режимы надёжности: если ffmpeg завис или упал, следующий режим проще.
+#   0 — все фильтры;  1 — без «ветвящихся» фильтров (рамка, пыль, блик, марево, выброс кадров),
+#   1 поток фильтров;  2 — минимум: масштаб, кроп, зеркало, цвет, шум.
+SAFE_MODES = ["полный", "безопасный", "минимальный"]
+
+
+def fx_layers(plan: Plan, w: int, h: int) -> list:
+    """Движущиеся полупрозрачные слои (пыль, блик) — смешиваются режимом grainmerge:
+    значение 128 = «нет изменений», поэтому слой затрагивает только свои пиксели.
+    Слои строятся из копии кадра (split), без бесконечных источников — синхронно по кадрам."""
+    out = []
+    if plan.dust_count:
+        lw, lh = even(w / 6), even(h / 6)
+        prob = plan.dust_count / (lw * lh)
+        A = plan.dust_amp
+        out.append(
+            f"split=2[dm][ds];[ds]scale={lw}:{lh},"
+            f"geq=lum='128+if(lt(random(0),{prob:.8f}),(2*gt(random(1),0.4)-1)*{A}*(0.6+0.4*random(2)),0)'"
+            f":cb='128':cr='128',scale={w}:{h}:flags=bicubic,format=yuv420p[dl];"
+            f"[dm][dl]blend=all_mode=grainmerge")
+    if plan.leak:
+        p1, p2, p3, f1, f2, R = plan.leak_params
+        L = plan.leak
+        ar = w / h
+        g = (f"exp(-((X/W-0.5-0.42*sin(2*PI*T/{p1}+{f1}))*(X/W-0.5-0.42*sin(2*PI*T/{p1}+{f1}))*{ar * ar:.4f}"
+             f"+(Y/H-0.5-0.4*cos(2*PI*T/{p2}+{f2}))*(Y/H-0.5-0.4*cos(2*PI*T/{p2}+{f2})))/{2 * R * R:.4f})"
+             f"*(0.7+0.3*sin(2*PI*T/{p3}))")
+        out.append(
+            f"split=2[lm][ls];[ls]scale={even(w / 8)}:{even(h / 8)},"
+            f"geq=lum='128+{L * 200:.1f}*{g}':cb='128-{L * 70:.1f}*{g}':cr='128+{L * 110:.1f}*{g}',"
+            f"scale={w}:{h}:flags=bicubic,format=yuv420p[ll];"
+            f"[lm][ll]blend=all_mode=grainmerge")
+    return out
+
+
+def haze_layer(plan: Plan, w: int, h: int) -> str:
+    """Тепловое марево: карты смещений (128 = без сдвига) из бегущих синусоид -> displace."""
+    ny, nx, sp = plan.haze_params
+    A = plan.haze
+    lw, lh = even(w / 8), even(h / 8)
+
+    def mp(phase: float, amp: float) -> str:
+        return (f"128+{amp:.2f}*sin(2*PI*(Y/H*{ny}+T*{sp}+{phase}))"
+                f"*sin(2*PI*(X/W*{nx}-T*{sp * 0.6:.2f}+{phase}))")
+    return (f"split=3[hm][hx0][hy0];"
+            f"[hx0]scale={lw}:{lh},geq=lum='{mp(0, A)}':cb='{mp(0, A / 2)}':cr='{mp(0, A / 2)}',"
+            f"scale={w}:{h}:flags=bicubic,format=yuv420p[hx];"
+            f"[hy0]scale={lw}:{lh},geq=lum='{mp(0.25, A)}':cb='{mp(0.25, A / 2)}':cr='{mp(0.25, A / 2)}',"
+            f"scale={w}:{h}:flags=bicubic,format=yuv420p[hy];"
+            f"[hm][hx][hy]displace=edge=smear")
+
+
+def build_video_filters(plan: Plan, info: dict, safe: int = 0) -> str:
     w, h = info["width"], info["height"]
     sw, sh = even(w * plan.scale), even(h * plan.scale)
     lanczos = "lanczos+accurate_rnd+full_chroma_int+full_chroma_inp"
@@ -569,20 +672,20 @@ def build_filters(plan: Plan, info: dict) -> tuple[str, str]:
         # HDR (HLG / PQ) -> SDR BT.709, иначе картинка бледная
         v.append("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
                  "tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv")
-    if plan.frame_drop_n:
+    if plan.frame_drop_n and safe == 0:
         # кадр выбрасывается, при выводе в постоянный FPS на его место встаёт предыдущий
         v.append(f"select='not(eq(mod(n,{plan.frame_drop_n}),{plan.frame_drop_k}))'")
     v.append(f"setpts=(PTS-STARTPTS)/{plan.speed}")
-    if plan.denoise:
+    if plan.denoise and safe < 2:
         d = plan.denoise
         v.append(f"hqdn3d={d}:{d * 0.75:.2f}:{d * 1.5:.2f}:{d * 1.1:.2f}")
-    if plan.lens_k1:
+    if plan.lens_k1 and safe < 2:
         v.append(f"lenscorrection=k1={plan.lens_k1}:k2={plan.lens_k1 / 2:.4f}:i=bilinear")
-    if plan.rotate_deg:
+    if plan.rotate_deg and safe < 2:
         v.append(f"rotate={plan.rotate_deg}*PI/180:ow=iw:oh=ih:bilinear=1:fillcolor=black")
     if (sw, sh) != (w, h):
         v.append(f"scale={sw}:{sh}:flags={lanczos}:param0=3")
-    if plan.drift_amp:
+    if plan.drift_amp and safe < 2:
         a, T = plan.drift_amp, plan.drift_period
         v.append(f"crop={w}:{h}:'{plan.crop_x}+{a}*sin(2*PI*t/{T})'"
                  f":'{plan.crop_y}+{a}*cos(2*PI*t/{T * 1.37:.2f})'")
@@ -594,29 +697,40 @@ def build_filters(plan: Plan, info: dict) -> tuple[str, str]:
              f":saturation={plan.saturation}:gamma={plan.gamma}")
     if plan.color_temp:
         c = plan.color_temp
-        d = round(c * 64, 2)   # сдвиг цветоразностных каналов: V (красный) +d, U (синий) -d
-        v.append(f"lutyuv=u='clip(val-{d},0,255)':v='clip(val+{d},0,255)'")
-    if plan.hue_deg:
+        d = round(abs(c) * 64, 2)   # сдвиг цветоразностных каналов: V (красный) и U (синий)
+        su, sv = ("-", "+") if c > 0 else ("+", "-")
+        v.append(f"lutyuv=u='clip(val{su}{d},0,255)':v='clip(val{sv}{d},0,255)'")
+    if plan.hue_deg and safe < 2:
         v.append(f"hue=h={plan.hue_deg}")
-    if plan.sharpen:
+    if plan.sharpen and safe < 2:
         v.append(f"unsharp=5:5:{plan.sharpen}:3:3:0")
-    if plan.border_scale:
-        # Фон: та же картинка, уменьшенная в 4 раза (быстро), размытая и растянутая обратно.
-        fw, fh = even(w * plan.border_scale), even(h * plan.border_scale)
-        r = max(1, plan.blur_amount // 4)
-        v.append(f"split=2[fg][bg];"
-                 f"[bg]scale={even(w / 4)}:{even(h / 4)}:flags=bilinear,boxblur={r}:2,"
-                 f"scale={w}:{h}:flags=bicubic,eq=brightness={-plan.blur_dim}[bgb];"
-                 f"[fg]scale={fw}:{fh}:flags={lanczos}[fgs];"
-                 f"[bgb][fgs]overlay={plan.border_x}:{plan.border_y}")
-    if plan.vignette:
+    v.append("format=yuv420p")
+    if safe == 0:
+        if plan.haze:
+            v.append(haze_layer(plan, w, h))
+        if plan.border_scale:
+            # Фон: та же картинка, уменьшенная в 4 раза (быстро), размытая и растянутая обратно.
+            fw, fh = even(w * plan.border_scale), even(h * plan.border_scale)
+            r = max(1, plan.blur_amount // 4)
+            v.append(f"split=2[fg][bg];"
+                     f"[bg]scale={even(w / 4)}:{even(h / 4)}:flags=bilinear,boxblur={r}:2,"
+                     f"scale={w}:{h}:flags=bicubic,eq=brightness={-plan.blur_dim}[bgb];"
+                     f"[fg]scale={fw}:{fh}:flags={lanczos}[fgs];"
+                     f"[bgb][fgs]overlay={plan.border_x}:{plan.border_y}:format=yuv420")
+        v.extend(fx_layers(plan, w, h))
+    if plan.vignette and safe < 2:
         # angle близко к 0 = очень мягкая виньетка
         v.append(f"vignette=angle={plan.vignette:.3f}")
     if plan.noise:
         v.append(f"noise=alls={plan.noise}:allf=t+u")
     v.append("setsar=1,format=yuv420p")
+    return ",".join(v)
 
+
+def build_audio_filters(plan: Plan, info: dict, safe: int = 0) -> str:
     sr = info["sample_rate"]
+    if safe >= 2:   # минимум: только темп и громкость
+        return f"asetpts=PTS-STARTPTS,atempo={plan.speed:.6f},volume={plan.volume_db}dB"
     a = [
         "asetpts=PTS-STARTPTS",
         # питч: меняем частоту дискретизации, затем возвращаем темп через atempo
@@ -626,89 +740,250 @@ def build_filters(plan: Plan, info: dict) -> tuple[str, str]:
         f"highpass=f={plan.highpass}",
         f"equalizer=f={plan.eq_freq}:t=q:w=1.0:g={plan.eq_gain}",
         f"volume={plan.volume_db}dB",
-        *( [f"extrastereo=m={plan.stereo}"] if info.get("channels") == 2 and plan.stereo != 1 else [] ),
-        f"aresample={plan.out_sample_rate}:resampler=soxr" if has_soxr() else
-        f"aresample={plan.out_sample_rate}",
     ]
-    if plan.audio_noise_db:
-        # тихий шум подмешивается прямо в звук (без anoisesrc: в ffmpeg 7 он вешал кодирование)
+    if info.get("channels") == 2 and plan.stereo != 1:
+        a.append(f"extrastereo=m={plan.stereo}")
+    if plan.audio_noise_db and safe == 0:
+        # тихий шум подмешивается прямо в звук
         amp = 10 ** (plan.audio_noise_db / 20)
         a.append(f"aeval='val(ch)+{amp:.6f}*(random(0)*2-1)':c=same")
-    return ",".join(v), ",".join(a)
+    a.append(f"aresample={plan.out_sample_rate}")
+    return ",".join(a)
 
 
-_SOXR = None
+def build_filters(plan: Plan, info: dict, safe: int = 0) -> tuple[str, str]:
+    return build_video_filters(plan, info, safe), build_audio_filters(plan, info, safe)
 
 
-def has_soxr() -> bool:
-    global _SOXR
-    if _SOXR is None:
-        out = subprocess.run(["ffmpeg", "-hide_banner", "-buildconf"],
-                             capture_output=True, text=True).stdout
-        _SOXR = "--enable-libsoxr" in out
-    return _SOXR
-
-
-def build_command(src: Path, dst: Path, plan: Plan, info: dict, codec: str,
-                  cqm_name: str | None, encoder: str = "cpu") -> list:
-    vf, af = build_filters(plan, info)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y",
-           "-filter_threads", str(max(1, CPU_THREADS // 2))]
+def input_args(src: Path, plan: Plan, info: dict) -> list:
+    cmd = []
     if plan.trim_start:
         cmd += ["-ss", f"{plan.trim_start}"]
     cmd += ["-i", str(src)]
     if info["duration"] and (plan.trim_start or plan.trim_end):
-        kept = info["duration"] - plan.trim_start - plan.trim_end
-        cmd += ["-t", f"{kept / plan.speed:.4f}"]
+        cmd += ["-t", f"{expected_duration(plan, info):.4f}"]
+    return cmd
 
-    cmd += ["-map", "0:v:0", "-vf", vf, "-r", info["rate"], "-fps_mode", "cfr"]
-    if info["has_audio"]:
-        cmd += ["-map", "0:a:0", "-af", af,
-                "-c:a", "aac", "-b:a", plan.audio_bitrate, "-ar", str(plan.out_sample_rate)]
+
+def expected_duration(plan: Plan, info: dict) -> float:
+    kept = info["duration"] - plan.trim_start - plan.trim_end
+    return max(0.1, kept / plan.speed)
+
+
+def base_args() -> list:
+    # -nostdin: ffmpeg не ждёт ввода с клавиатуры (на Windows это иногда «вешает» процесс)
+    # -progress pipe:1: машинно-читаемый прогресс для сторожа
+    return ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
+            "-nostats", "-progress", "pipe:1", "-y"]
+
+
+def build_video_command(src: Path, dst: Path, plan: Plan, info: dict, codec: str,
+                        cqm_name: str | None, encoder: str = "cpu", safe: int = 0) -> list:
+    vf = build_video_filters(plan, info, safe)
+    ft = max(1, CPU_THREADS // 2) if safe == 0 else 1
+    cmd = base_args() + ["-filter_threads", str(ft)] + input_args(src, plan, info)
+    cmd += ["-map", "0:v:0", "-an", "-sn", "-dn", "-vf", vf,
+            "-r", info["rate"], "-fps_mode", "cfr"]
 
     common = (f"aq-mode={plan.aq_mode}:aq-strength={plan.aq_strength}"
               f":keyint={plan.keyint}:min-keyint={max(1, plan.keyint // 10)}"
               f":bframes={plan.bframes}:ref={plan.refs}:deblock={plan.deblock}")
+    threads = str(CPU_THREADS) if safe == 0 else "0"
     if encoder == "amd":
         # AMD AMF (Radeon R7 370 = VCE 1.0): только H.264, без B-кадров, CQM и AQ
         q = plan.crf + 1
         cmd += ["-c:v", "h264_amf", "-usage", "transcoding", "-quality", "quality",
                 "-profile:v", "high", "-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q + 2),
                 "-g", str(plan.keyint), "-pix_fmt", "yuv420p"]
-        tag = []
     elif codec == "h264":
-        params = (f"{common}:psy-rd={plan.psy_rd}:me={plan.me}:subme={plan.subme}"
-                  f":8x8dct=1:trellis=2")
-        if cqm_name:
-            params += f":cqmfile={cqm_name}"
-        cmd += ["-c:v", "libx264", "-profile:v", "high", "-threads", str(CPU_THREADS),
+        if safe >= 2:
+            params = f"keyint={plan.keyint}:aq-mode={plan.aq_mode}"
+        else:
+            params = (f"{common}:psy-rd={plan.psy_rd}:me={plan.me}:subme={plan.subme}"
+                      f":8x8dct=1:trellis=2")
+            if cqm_name:
+                params += f":cqmfile={cqm_name}"
+        cmd += ["-c:v", "libx264", "-profile:v", "high", "-threads", threads,
                 "-x264-params", params,
                 "-bsf:v", "filter_units=remove_types=6"]   # SEI с настройками x264
-        tag = []
     else:
         psy = plan.psy_rd.split(",")[0]
         params = (f"{common}:psy-rd={psy}:me={plan.me}:subme={min(plan.subme, 7)}"
                   f":log-level=error:info=0")                # info=0: без SEI-подписи
-        cmd += ["-c:v", "libx265", "-threads", str(CPU_THREADS), "-x265-params", params]
-        tag = ["-tag:v", "hvc1"]
+        cmd += ["-c:v", "libx265", "-threads", threads, "-x265-params", params, "-tag:v", "hvc1"]
     if encoder != "amd":
-        cmd += ["-crf", str(plan.crf), "-preset", plan.preset, "-pix_fmt", "yuv420p"] + tag
+        cmd += ["-crf", str(plan.crf), "-preset", plan.preset, "-pix_fmt", "yuv420p"]
     if info["hdr"] and TONEMAP_HDR:
         cmd += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
+    cmd += ["-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact", str(dst)]
+    return cmd
 
+
+def build_audio_command(src: Path, dst: Path, plan: Plan, info: dict, safe: int = 0) -> list:
+    af = build_audio_filters(plan, info, safe)
+    cmd = base_args() + input_args(src, plan, info)
+    cmd += ["-map", "0:a:0", "-vn", "-sn", "-dn", "-af", af,
+            "-c:a", "aac", "-b:a", plan.audio_bitrate, "-ar", str(plan.out_sample_rate),
+            "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:a", "+bitexact", str(dst)]
+    return cmd
+
+
+def build_mux_command(video: Path, audio: Path | None, dst: Path, plan: Plan) -> list:
     m = plan.meta
-    cmd += ["-map_metadata", "-1", "-map_chapters", "-1",
+    cmd = base_args() + ["-i", str(video)]
+    if audio:
+        cmd += ["-i", str(audio)]
+    cmd += ["-map", "0:v:0"] + (["-map", "1:a:0", "-shortest"] if audio else [])
+    cmd += ["-c", "copy",
+            "-map_metadata", "-1", "-map_metadata:s:v", "-1", "-map_metadata:s:a", "-1",
+            "-map_chapters", "-1",
             "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact",
             "-metadata", f"creation_time={m['creation_time']}",
             "-metadata", f"comment={m['comment']}",
             "-metadata:s:v:0", f"handler_name={m['handler_name']}",
             "-metadata:s:v:0", f"encoder={m['encoder']}"]
-    if info["has_audio"]:
+    if audio:
         cmd += ["-metadata:s:a:0", f"handler_name={m['audio_handler']}"]
     if dst.suffix.lower() in (".mp4", ".mov", ".m4v"):
         cmd += ["-movflags", "+faststart"]
     cmd.append(str(dst))
     return cmd
+
+
+def build_command(src: Path, dst: Path, plan: Plan, info: dict, codec: str,
+                  cqm_name: str | None, encoder: str = "cpu") -> list:
+    """Для --dry-run: команда видеопрохода."""
+    return build_video_command(src, dst, plan, info, codec, cqm_name, encoder)
+
+
+# --------------------------------------------------------------------------- запуск со сторожем
+
+class Stalled(RuntimeError):
+    pass
+
+
+def run_ffmpeg(cmd: list, cwd: str, label: str, total_frames: int = 0,
+               total_sec: float = 0.0, stall: int | None = None) -> None:
+    """Запускает ffmpeg, показывает свой прогресс и убивает процесс, если он завис:
+    нет новых кадров/времени дольше STALL_TIMEOUT секунд. Ошибки ffmpeg -> RuntimeError."""
+    stall = stall or STALL_TIMEOUT
+    err_lines: list = []
+    state = {"frame": 0, "sec": 0.0, "last": time.monotonic(), "speed": ""}
+
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                            errors="replace", bufsize=1)
+
+    def read_progress():
+        for line in proc.stdout:
+            k, _, val = line.strip().partition("=")
+            if k == "frame" and val.isdigit() and int(val) > state["frame"]:
+                state["frame"], state["last"] = int(val), time.monotonic()
+            elif k == "out_time_us" and val.lstrip("-").isdigit():
+                sec = int(val) / 1e6
+                if sec > state["sec"]:
+                    state["sec"], state["last"] = sec, time.monotonic()
+            elif k == "fps":
+                state["speed"] = val
+
+    def read_err():
+        for line in proc.stderr:
+            err_lines.append(line.rstrip())
+            del err_lines[:-30]
+
+    threads = [threading.Thread(target=f, daemon=True) for f in (read_progress, read_err)]
+    for t in threads:
+        t.start()
+    try:
+        while proc.poll() is None:
+            time.sleep(0.5)
+            if total_frames:
+                pct = min(100, 100 * state["frame"] / total_frames)
+                info = f"{state['frame']}/{total_frames} кадров, {state['speed'] or '0'} fps"
+            else:
+                pct = min(100, 100 * state["sec"] / total_sec) if total_sec else 0
+                info = f"{state['sec']:.1f}/{total_sec:.1f} c"
+            bar = "#" * int(pct / 5) + "-" * (20 - int(pct / 5))
+            print(f"\r  {label:6s} [{bar}] {pct:5.1f}%  {info}   ", end="", file=sys.stderr, flush=True)
+            if time.monotonic() - state["last"] > stall:
+                proc.kill()
+                proc.wait()
+                print(file=sys.stderr)
+                raise Stalled(f"{label}: нет прогресса {stall} с — процесс остановлен")
+    except KeyboardInterrupt:
+        proc.kill()
+        raise
+    finally:
+        for t in threads:
+            t.join(timeout=2)
+    print(file=sys.stderr)
+    if proc.returncode != 0:
+        raise RuntimeError(f"{label}: ffmpeg код {proc.returncode}: " + " | ".join(err_lines[-5:]))
+
+
+def media_duration(path: Path) -> float:
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=nw=1:nk=1", str(path)],
+                             capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                             timeout=60).stdout
+        return float(out.strip() or 0)
+    except (ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
+def encode(src: Path, dst: Path, plan: Plan, info: dict, args, tmp: str,
+           cqm_name: str | None) -> int:
+    """Видео и звук кодируются ОТДЕЛЬНО (так они не могут заблокировать друг друга), затем
+    склеиваются без перекодирования. При зависании/ошибке — повтор в более простом режиме.
+    Возвращает номер режима, в котором всё получилось."""
+    exp = expected_duration(plan, info) if info["duration"] else 0.0
+    fps = info["fps"]
+    num, _, den = info["rate"].partition("/")
+    try:
+        fps = float(num) / float(den or 1)
+    except ValueError:
+        pass
+    total_frames = int(exp * fps) if exp else 0
+    vtmp, atmp = Path(tmp) / "video.mp4", Path(tmp) / "audio.m4a"
+    out_tmp = Path(tmp) / f"out{dst.suffix}"
+
+    last_err = None
+    for safe in range(len(SAFE_MODES)):
+        if safe:
+            log(f"  -> повтор в режиме «{SAFE_MODES[safe]}»")
+        try:
+            encoder = args.encoder
+            try:
+                run_ffmpeg(build_video_command(src, vtmp, plan, info, args.codec, cqm_name,
+                                               encoder, safe), tmp, "видео", total_frames, exp)
+            except RuntimeError as e:
+                if encoder != "amd" or isinstance(e, Stalled):
+                    raise
+                log("  AMD AMF не сработал (драйвер/видеокарта) — кодирую на процессоре (cpu).")
+                args.encoder = "cpu"
+                run_ffmpeg(build_video_command(src, vtmp, plan, info, args.codec, cqm_name,
+                                               "cpu", safe), tmp, "видео", total_frames, exp)
+            audio = None
+            if info["has_audio"]:
+                run_ffmpeg(build_audio_command(src, atmp, plan, info, safe), tmp, "звук",
+                           total_sec=exp)
+                audio = atmp
+            run_ffmpeg(build_mux_command(vtmp, audio, out_tmp, plan), tmp, "сборка",
+                       total_sec=exp)
+            got = media_duration(out_tmp)
+            if exp and got < exp * 0.9:
+                raise RuntimeError(f"длительность {got:.1f} c вместо {exp:.1f} c")
+            if dst.exists():
+                dst.unlink()
+            shutil.move(str(out_tmp), str(dst))
+            return safe
+        except KeyboardInterrupt:
+            raise
+        except RuntimeError as e:
+            last_err = e
+            log(f"  !! {e}")
+    raise RuntimeError(f"не удалось ни в одном режиме: {last_err}")
 
 
 # --------------------------------------------------------------------------- pHash
@@ -729,10 +1004,13 @@ def phash_frame(gray32) -> int:
 
 
 def grab_gray32(path: Path, t: float):
-    cmd = ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", str(path),
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", str(path),
            "-frames:v", "1", "-vf", "scale=32:32:flags=area,format=gray",
            "-f", "rawvideo", "-"]
-    raw = subprocess.run(cmd, capture_output=True).stdout
+    try:
+        raw = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=60).stdout
+    except subprocess.TimeoutExpired:
+        return None
     if len(raw) < 1024:
         return None
     return np.frombuffer(raw[:1024], dtype=np.uint8).reshape(32, 32).astype(np.float64)
@@ -784,19 +1062,9 @@ def process(src: Path, out_dir: Path, index: int, args, base_seed: int) -> dict:
             log(f"[{src.name} #{index}] попытка {attempt}, seed={attempt_seed}, "
                 f"сила={strength:.2f}, {info['width']}x{info['height']}"
                 f"{', HDR->SDR' if info['hdr'] and TONEMAP_HDR else ''}, энкодер={args.encoder}")
-            log("  (первые 10–30 с счётчик frame=0 — это нормально: энкодер набирает кадры)")
-            proc = subprocess.run(cmd, cwd=tmp)
-            if proc.returncode != 0 and args.encoder == "amd":
-                log("  AMD AMF не сработал (драйвер/видеокарта) — переключаюсь на процессор (cpu).")
-                args.encoder = "cpu"
-                plan = make_plan(info, attempt_seed, args.intensity, strength, args)
-                if plan.cqm:
-                    cqm_name = "cqm.cfg"
-                    write_cqm(plan.cqm, Path(tmp) / cqm_name)
-                cmd = build_command(src.resolve(), dst, plan, info, args.codec, cqm_name, "cpu")
-                proc = subprocess.run(cmd, cwd=tmp)
-            if proc.returncode != 0:
-                raise RuntimeError(f"ffmpeg завершился с кодом {proc.returncode}")
+            mode = encode(src.resolve(), dst, plan, info, args, tmp, cqm_name)
+            if mode:
+                log(f"  готово в режиме «{SAFE_MODES[mode]}» (часть фильтров отключена)")
 
         ph = phash_distance(src, dst, plan, info) if not args.no_verify else None
         result = {
