@@ -70,7 +70,7 @@ FILTERS = dict(
     # Lanczos micro-scaling: увеличение кадра и обрезка обратно в исходный размер.
     #   (1.02, 1.04) -> приближение на 2–4 %, края срезаются. Меняет геометрию кадра для pHash.
     #   (1.0, 1.0)   -> выключено.   Больше 1.08 — уже заметно «наехала» камера.
-    scale=(1.04, 1.06),
+    scale=(1.02, 1.04),
 
     # Поворот кадра в градусах (±). 0.5 -> до ±0.5°. Масштаб сам подрастёт, чтобы не было
     # чёрных углов. Больше 2° — заметно глазу. 0 = выкл.
@@ -134,6 +134,15 @@ FILTERS = dict(
 
     # Ширина стерео: 0.05 = ±5 %. Только для стерео-звука. 0 = выкл.
     stereo=0.05,
+
+    # ---- Размытый фон по краям ----
+    # Видео уменьшается до доли кадра, а по краям — размытая копия этого же кадра.
+    #   (0.92, 0.95) -> видео занимает 92–95 % кадра, по краям тонкая размытая рамка.
+    #                   Сильно меняет pHash, выглядит как обычный «эффект для соцсетей».
+    #   (0.85, 0.88) -> широкая рамка, заметно.   (0, 0) = выкл.   STRENGTH не влияет.
+    blur_border=(0.92, 0.95),
+    blur_amount=20,     # сила размытия фона: 10 — мягко, 20 — норм, 40 — сплошное пятно
+    blur_dim=0.05,      # затемнение фона: 0.05 = на 5 % темнее, чтобы видео выделялось
 )
 
 # Готовые пресеты (используются при LEVEL = "low" / "medium" / "high"). Ключи — как в FILTERS.
@@ -141,15 +150,15 @@ PRESETS = {
     "low": dict(mirror=True, scale=(1.010, 1.020), rotate=0.0, brightness=0.010, contrast=0.015,
                 saturation=0.03, gamma=0.02, hue=1.0, noise=(1, 3), sharpen=0.15, vignette=0.0,
                 speed=0.010, trim_frames=(0, 2), audio_pitch=0.004, volume=0.5, eq_gain=1.0,
-                color_temp=0.01, lens=0.005, drift=2, frame_drop=(150, 240), denoise=0.8, audio_noise=-66, stereo=0.03),
+                color_temp=0.01, lens=0.005, drift=2, frame_drop=(150, 240), denoise=0.8, audio_noise=-66, stereo=0.03, blur_border=(0.95, 0.97)),
     "medium": dict(mirror=True, scale=(1.020, 1.040), rotate=0.5, brightness=0.020, contrast=0.030,
                    saturation=0.06, gamma=0.04, hue=2.5, noise=(2, 5), sharpen=0.30, vignette=0.15,
                    speed=0.020, trim_frames=(1, 4), audio_pitch=0.008, volume=1.0, eq_gain=2.0,
-                   color_temp=0.02, lens=0.01, drift=3, frame_drop=(90, 150), denoise=1.0, audio_noise=-66, stereo=0.05),
+                   color_temp=0.02, lens=0.01, drift=3, frame_drop=(90, 150), denoise=1.0, audio_noise=-66, stereo=0.05, blur_border=(0.92, 0.95)),
     "high": dict(mirror=True, scale=(1.040, 1.070), rotate=1.2, brightness=0.035, contrast=0.050,
                  saturation=0.10, gamma=0.07, hue=5.0, noise=(4, 8), sharpen=0.50, vignette=0.30,
                  speed=0.035, trim_frames=(2, 8), audio_pitch=0.015, volume=1.5, eq_gain=3.0,
-                 color_temp=0.035, lens=0.02, drift=5, frame_drop=(60, 100), denoise=1.5, audio_noise=-66, stereo=0.08),
+                 color_temp=0.035, lens=0.02, drift=5, frame_drop=(60, 100), denoise=1.5, audio_noise=-66, stereo=0.08, blur_border=(0.88, 0.92)),
 }
 
 # ---------------------------------------------------------------- кодирование / железо
@@ -300,6 +309,11 @@ class Plan:
     highpass: int = 20
     audio_noise_db: float = 0.0
     stereo: float = 1.0
+    border_scale: float = 0.0
+    border_x: int = 0
+    border_y: int = 0
+    blur_amount: int = 20
+    blur_dim: float = 0.0
     out_sample_rate: int = 48000
     audio_bitrate: str = "160k"
     # энкодер
@@ -424,6 +438,16 @@ def make_plan(info: dict, seed: int, intensity: str, strength: float, args) -> P
     plan.highpass = rng.randint(18, 35)
     plan.audio_noise_db = round(p.get("audio_noise", 0) + rng.uniform(-2, 2), 1) if p.get("audio_noise") else 0.0
     plan.stereo = round(1 + sym(p.get("stereo", 0)), 3)
+
+    bb = p.get("blur_border", (0, 0))
+    if bb and bb[0] and bb[1]:
+        plan.border_scale = round(rng.uniform(*bb), 4)
+        fw, fh = even(w * plan.border_scale), even(h * plan.border_scale)
+        # видео не строго по центру: случайный сдвиг в пределах 30 % рамки
+        plan.border_x = int((w - fw) / 2 + rng.uniform(-0.3, 0.3) * (w - fw) / 2)
+        plan.border_y = int((h - fh) / 2 + rng.uniform(-0.3, 0.3) * (h - fh) / 2)
+        plan.blur_amount = int(p.get("blur_amount", 20))
+        plan.blur_dim = float(p.get("blur_dim", 0.0))
     plan.out_sample_rate = rng.choice([44100, 48000])
     plan.audio_bitrate = rng.choice(["128k", "144k", "160k", "192k"])
 
@@ -497,6 +521,15 @@ def build_filters(plan: Plan, info: dict) -> tuple[str, str]:
         v.append(f"hue=h={plan.hue_deg}")
     if plan.sharpen:
         v.append(f"unsharp=5:5:{plan.sharpen}:3:3:0")
+    if plan.border_scale:
+        # Фон: та же картинка, уменьшенная в 4 раза (быстро), размытая и растянутая обратно.
+        fw, fh = even(w * plan.border_scale), even(h * plan.border_scale)
+        r = max(1, plan.blur_amount // 4)
+        v.append(f"split=2[fg][bg];"
+                 f"[bg]scale={even(w / 4)}:{even(h / 4)}:flags=bilinear,boxblur={r}:2,"
+                 f"scale={w}:{h}:flags=bicubic,eq=brightness={-plan.blur_dim}[bgb];"
+                 f"[fg]scale={fw}:{fh}:flags={lanczos}[fgs];"
+                 f"[bgb][fgs]overlay={plan.border_x}:{plan.border_y}")
     if plan.vignette:
         # angle близко к 0 = очень мягкая виньетка
         v.append(f"vignette=angle={plan.vignette:.3f}")
