@@ -1,7 +1,7 @@
 # ==============================================================================
 #  Vid2Vid restyle для Google Colab (GPU T4) — ОДНА ЯЧЕЙКА, просто запусти.
 #  Drive: Мой диск/Colab Notebooks/content/input_videos  ->  .../output_iphone
-#  Пайплайн: HFLIP -> SD1.5 img2img + ControlNet (Tile + Depth)
+#  Пайплайн: HFLIP -> SD1.5 + LCM-LoRA (быстро, 3 шага) + ControlNet Tile (+Depth опц.)
 #            -> оптический поток (Farneback) для временной стабильности
 #            -> сборка обратно в mp4 с оригинальным звуком
 # ==============================================================================
@@ -12,22 +12,21 @@ INPUT_DIR  = f"{BASE_DIR}/input_videos"
 OUTPUT_DIR = f"{BASE_DIR}/output_iphone"
 
 PROMPT     = "high quality photo, natural lighting, detailed textures, sharp focus"
-NEG_PROMPT = "blurry, lowres, artifacts, deformed, distorted, watermark, text, cartoon"
 
-STRENGTH       = 0.30   # denoising strength: 0.15–0.35 (выше = сильнее перерисовка, больше мерцания)
-STEPS          = 25     # реально выполняется STEPS*STRENGTH шагов (~8)
-CFG            = 5.0
+STRENGTH       = 0.30   # сила перерисовки: 0.2–0.4 (выше = сильнее отличие, больше мерцания)
+STEPS          = 10     # с LCM реально выполняется STEPS*STRENGTH = 3 шага
 TILE_SCALE     = 0.60   # вес ControlNet Tile (держит детали/цвета)
-DEPTH_SCALE    = 0.45   # вес ControlNet Depth (держит геометрию)
+USE_DEPTH      = False  # True = + ControlNet Depth (точнее геометрия, но ~1.5x медленнее)
+DEPTH_SCALE    = 0.45
 SEED           = 42     # одинаковый шум на всех кадрах = меньше мерцания
 FLOW_BLEND     = 0.30   # доля предыдущего (сгенерированного и сдвинутого потоком) кадра
 SCENE_CUT_DIFF = 35.0   # порог смены сцены (на склейке поток не применяется)
-MAX_SIDE       = 768    # рабочее разрешение по длинной стороне (T4: 640–768)
-MAX_FPS        = 30     # если исходник 60 fps — обработаем 30 (вдвое быстрее)
+MAX_SIDE       = 640    # рабочее разрешение по длинной стороне (512 = быстрее, 768 = детальнее)
+MAX_FPS        = 30     # если исходник 60 fps — обработаем 30
 CRF            = 17     # качество итогового x264 (меньше = лучше)
 # ------------------------------------------------------------------------------
 
-import os, sys, glob, json, shutil, subprocess
+import os, sys, glob, json, shutil, subprocess, time
 
 def sh(cmd):
     subprocess.run(cmd, shell=True, check=True)
@@ -38,41 +37,48 @@ drive.mount("/content/drive")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 2) Зависимости
-sh(f"{sys.executable} -m pip -q install -U diffusers transformers accelerate opencv-python-headless")
+sh(f"{sys.executable} -m pip -q install -U diffusers transformers accelerate peft opencv-python-headless")
 
 import cv2, numpy as np, torch
 from PIL import Image
 from tqdm.auto import tqdm
-from diffusers import (StableDiffusionControlNetImg2ImgPipeline, ControlNetModel,
-                       UniPCMultistepScheduler)
-from transformers import pipeline as hf_pipeline
+from diffusers import StableDiffusionControlNetImg2ImgPipeline, ControlNetModel, LCMScheduler
 
 assert torch.cuda.is_available(), "Нет GPU: Среда выполнения -> Сменить среду -> T4 GPU"
 DEV = "cuda"
+torch.backends.cuda.matmul.allow_tf32 = True
 
 # 3) Модели
 print("Загрузка моделей...")
-cn_tile  = ControlNetModel.from_pretrained("lllyasviel/control_v11f1e_sd15_tile",  torch_dtype=torch.float16)
-cn_depth = ControlNetModel.from_pretrained("lllyasviel/control_v11f1p_sd15_depth", torch_dtype=torch.float16)
+cn_tile = ControlNetModel.from_pretrained("lllyasviel/control_v11f1e_sd15_tile", torch_dtype=torch.float16)
+if USE_DEPTH:
+    from transformers import pipeline as hf_pipeline
+    cn_depth = ControlNetModel.from_pretrained("lllyasviel/control_v11f1p_sd15_depth", torch_dtype=torch.float16)
+    controlnet = [cn_tile, cn_depth]
+    depth_est = hf_pipeline("depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf", device=0)
+else:
+    controlnet = cn_tile
+
 pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
     "stable-diffusion-v1-5/stable-diffusion-v1-5",
-    controlnet=[cn_tile, cn_depth], torch_dtype=torch.float16,
+    controlnet=controlnet, torch_dtype=torch.float16,
     safety_checker=None, requires_safety_checker=False,
 ).to(DEV)
-pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+# LCM-LoRA: 3 шага вместо ~8 и без CFG (ещё x2) — главный источник ускорения
+pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
+pipe.load_lora_weights("latent-consistency/lcm-lora-sdv15")
+pipe.fuse_lora()
 try:
     pipe.vae.enable_slicing()  # в новых diffusers pipe.enable_vae_slicing() удалён
 except AttributeError:
     pass
 pipe.set_progress_bar_config(disable=True)
 
-depth_est = hf_pipeline("depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf", device=0)
-
 # 4) Утилиты
 def probe(path):
     out = subprocess.check_output(
         f'ffprobe -v error -select_streams v:0 '
-        f'-show_entries stream=width,height,r_frame_rate:stream_tags=rotate:stream_side_data=rotation '
+        f'-show_entries stream=width,height,r_frame_rate,color_transfer:stream_tags=rotate:stream_side_data=rotation '
         f'-of json "{path}"', shell=True)
     s = json.loads(out)["streams"][0]
     n, d = s["r_frame_rate"].split("/")
@@ -83,7 +89,9 @@ def probe(path):
         rot = sd.get("rotation", rot)
     if rot is not None and abs(int(float(rot))) % 180 == 90:
         w, h = h, w
-    return w, h, float(n) / float(d)
+    # iPhone по умолчанию снимает в HDR (HLG/Dolby Vision) — без тонмаппинга цвета будут блёклыми
+    hdr = s.get("color_transfer") in ("arib-std-b67", "smpte2084")
+    return w, h, float(n) / float(d), hdr
 
 def work_size(w, h):
     k = MAX_SIDE / max(w, h)
@@ -103,16 +111,24 @@ def warp(prev_img, cur_gray, prev_gray):
     return cv2.remap(prev_img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
 def process_video(src, dst):
-    W, H, fps = probe(src)
+    t0 = time.time()
+    W, H, fps, hdr = probe(src)
     fps = min(fps, MAX_FPS)
     ww, wh = work_size(W, H)
     tmp = "/content/_v2v"
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(f"{tmp}/in"); os.makedirs(f"{tmp}/out")
 
-    # HFLIP + масштаб + fps — сразу при извлечении кадров
-    sh(f'ffmpeg -v error -i "{src}" -vf "hflip,fps={fps},scale={ww}:{wh}:flags=lanczos" '
-       f'-q:v 1 "{tmp}/in/%06d.png"')
+    # HFLIP + (HDR->SDR) + масштаб + fps — сразу при извлечении кадров
+    base_vf = f"hflip,fps={fps},scale={ww}:{wh}:flags=lanczos"
+    tonemap = ("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+               "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,")
+    try:
+        sh(f'ffmpeg -v error -i "{src}" -vf "{tonemap if hdr else ""}{base_vf}" -q:v 1 "{tmp}/in/%06d.png"')
+    except subprocess.CalledProcessError:
+        print("Тонмаппинг HDR недоступен, извлекаю без него")
+        for f in glob.glob(f"{tmp}/in/*.png"): os.remove(f)
+        sh(f'ffmpeg -v error -i "{src}" -vf "{base_vf}" -q:v 1 "{tmp}/in/%06d.png"')
     frames = sorted(glob.glob(f"{tmp}/in/*.png"))
 
     prev_gray = prev_out = None
@@ -126,14 +142,16 @@ def process_video(src, dst):
             init = cv2.addWeighted(cur, 1 - FLOW_BLEND, warped, FLOW_BLEND, 0)
 
         cur_pil = Image.fromarray(cur)
-        depth = depth_est(cur_pil)["depth"].convert("RGB").resize((ww, wh))
+        if USE_DEPTH:
+            depth = depth_est(cur_pil)["depth"].convert("RGB").resize((ww, wh))
+            control, scale = [cur_pil, depth], [TILE_SCALE, DEPTH_SCALE]
+        else:
+            control, scale = cur_pil, TILE_SCALE
         g = torch.Generator(DEV).manual_seed(SEED)
         out = pipe(
-            prompt=PROMPT, negative_prompt=NEG_PROMPT,
-            image=Image.fromarray(init), control_image=[cur_pil, depth],
-            strength=STRENGTH, num_inference_steps=STEPS, guidance_scale=CFG,
-            controlnet_conditioning_scale=[TILE_SCALE, DEPTH_SCALE],
-            generator=g,
+            prompt=PROMPT, image=Image.fromarray(init), control_image=control,
+            strength=STRENGTH, num_inference_steps=STEPS, guidance_scale=1.0,
+            controlnet_conditioning_scale=scale, generator=g,
         ).images[0]
 
         out_np = np.array(out)
@@ -145,8 +163,9 @@ def process_video(src, dst):
     audio_map = "-map 1:a:0 -c:a aac -b:a 192k -shortest" if audio_in else ""
     sh(f'ffmpeg -v error -y -framerate {fps} -i "{tmp}/out/%06d.png" {audio_in} '
        f'-map 0:v:0 {audio_map} -vf "scale={W}:{H}:flags=lanczos" '
-       f'-c:v libx264 -preset slow -crf {CRF} -pix_fmt yuv420p -movflags +faststart "{dst}"')
+       f'-c:v libx264 -preset medium -crf {CRF} -pix_fmt yuv420p -movflags +faststart "{dst}"')
     shutil.rmtree(tmp, ignore_errors=True)
+    print(f"Время: {(time.time() - t0) / 60:.1f} мин")
 
 # 5) Обработка всех видео (уже готовые пропускаются — можно перезапускать)
 EXTS = (".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm")
