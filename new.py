@@ -332,6 +332,9 @@ def probe(path: Path) -> dict:
         "rotation": rotation,
         "hdr": video.get("color_transfer") in ("arib-std-b67", "smpte2084"),
         "fps": fps or 30.0,
+        # номинальная частота кадров (30/1, 30000/1001 ...) — задаём её на выходе явно,
+        # иначе ffmpeg 7 после select/overlay подставляет 25 fps и теряет кадры
+        "rate": video.get("r_frame_rate") if video.get("r_frame_rate", "0/0") != "0/0" else "30/1",
         "duration": duration,
         "has_audio": audio is not None,
         "sample_rate": int(audio["sample_rate"]) if audio else 48000,
@@ -627,6 +630,10 @@ def build_filters(plan: Plan, info: dict) -> tuple[str, str]:
         f"aresample={plan.out_sample_rate}:resampler=soxr" if has_soxr() else
         f"aresample={plan.out_sample_rate}",
     ]
+    if plan.audio_noise_db:
+        # тихий шум подмешивается прямо в звук (без anoisesrc: в ffmpeg 7 он вешал кодирование)
+        amp = 10 ** (plan.audio_noise_db / 20)
+        a.append(f"aeval='val(ch)+{amp:.6f}*(random(0)*2-1)':c=same")
     return ",".join(v), ",".join(a)
 
 
@@ -654,17 +661,8 @@ def build_command(src: Path, dst: Path, plan: Plan, info: dict, codec: str,
         kept = info["duration"] - plan.trim_start - plan.trim_end
         cmd += ["-t", f"{kept / plan.speed:.4f}"]
 
-    cmd += ["-map", "0:v:0", "-vf", vf]
-    if info["has_audio"] and plan.audio_noise_db:
-        amp = 10 ** (plan.audio_noise_db / 20)
-        layout = "stereo" if info["channels"] == 2 else "mono"
-        fc = (f"[0:a:0]{af}[a0];"
-              f"anoisesrc=c=pink:r={plan.out_sample_rate}:a={amp:.6f}:seed={plan.seed % 100000},"
-              f"aformat=channel_layouts={layout}[an];"
-              f"[a0][an]amix=inputs=2:duration=first:normalize=0[aout]")
-        cmd += ["-filter_complex", fc, "-map", "[aout]", "-ac", str(info["channels"] or 2),
-                "-c:a", "aac", "-b:a", plan.audio_bitrate, "-ar", str(plan.out_sample_rate)]
-    elif info["has_audio"]:
+    cmd += ["-map", "0:v:0", "-vf", vf, "-r", info["rate"], "-fps_mode", "cfr"]
+    if info["has_audio"]:
         cmd += ["-map", "0:a:0", "-af", af,
                 "-c:a", "aac", "-b:a", plan.audio_bitrate, "-ar", str(plan.out_sample_rate)]
 
