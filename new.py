@@ -46,9 +46,9 @@ except ImportError:  # pHash станет недоступен, остально
 
 # ---------------------------------------------------------------- основное
 COPIES = 1              # сколько уникальных копий делать из каждого видео
-LEVEL = "custom"        # "custom" — берутся значения из FILTERS ниже;
+LEVEL = "high"          # "custom" — берутся значения из FILTERS ниже;
                         # "low" / "medium" / "high" — готовые пресеты (см. PRESETS)
-STRENGTH = 2.0          # общий множитель силы всех фильтров: 0.5 = вдвое мягче, 2.0 = вдвое сильнее.
+STRENGTH = 1.0          # общий множитель силы всех фильтров: 0.5 = вдвое мягче, 2.0 = вдвое сильнее.
                         # Умножает ВСЁ в FILTERS (кроме mirror): при 2.0 scale (1.04, 1.06) даёт
                         # приближение 8–12 %, rotate 0.7 -> до ±1.4°, hue 2.5 -> до ±5° и т. д.
 SEED = None             # None = каждый запуск разный; число (например 42) = одинаковый результат
@@ -575,10 +575,10 @@ def build_filters(plan: Plan, info: dict) -> tuple[str, str]:
         v.append(f"hqdn3d={d}:{d * 0.75:.2f}:{d * 1.5:.2f}:{d * 1.1:.2f}")
     if plan.lens_k1:
         v.append(f"lenscorrection=k1={plan.lens_k1}:k2={plan.lens_k1 / 2:.4f}:i=bilinear")
-    if (sw, sh) != (w, h):
-        v.append(f"scale={sw}:{sh}:flags={lanczos}:param0=3")
     if plan.rotate_deg:
         v.append(f"rotate={plan.rotate_deg}*PI/180:ow=iw:oh=ih:bilinear=1:fillcolor=black")
+    if (sw, sh) != (w, h):
+        v.append(f"scale={sw}:{sh}:flags={lanczos}:param0=3")
     if plan.drift_amp:
         a, T = plan.drift_amp, plan.drift_period
         v.append(f"crop={w}:{h}:'{plan.crop_x}+{a}*sin(2*PI*t/{T})'"
@@ -591,7 +591,8 @@ def build_filters(plan: Plan, info: dict) -> tuple[str, str]:
              f":saturation={plan.saturation}:gamma={plan.gamma}")
     if plan.color_temp:
         c = plan.color_temp
-        v.append(f"colorbalance=rm={c}:bm={-c}:rh={c / 2:.4f}:bh={-c / 2:.4f}")
+        d = round(c * 64, 2)   # сдвиг цветоразностных каналов: V (красный) +d, U (синий) -d
+        v.append(f"lutyuv=u='clip(val-{d},0,255)':v='clip(val+{d},0,255)'")
     if plan.hue_deg:
         v.append(f"hue=h={plan.hue_deg}")
     if plan.sharpen:
@@ -785,6 +786,7 @@ def process(src: Path, out_dir: Path, index: int, args, base_seed: int) -> dict:
             log(f"[{src.name} #{index}] попытка {attempt}, seed={attempt_seed}, "
                 f"сила={strength:.2f}, {info['width']}x{info['height']}"
                 f"{', HDR->SDR' if info['hdr'] and TONEMAP_HDR else ''}, энкодер={args.encoder}")
+            log("  (первые 10–30 с счётчик frame=0 — это нормально: энкодер набирает кадры)")
             proc = subprocess.run(cmd, cwd=tmp)
             if proc.returncode != 0 and args.encoder == "amd":
                 log("  AMD AMF не сработал (драйвер/видеокарта) — переключаюсь на процессор (cpu).")
