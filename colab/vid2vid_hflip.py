@@ -71,11 +71,19 @@ depth_est = hf_pipeline("depth-estimation", model="depth-anything/Depth-Anything
 # 4) Утилиты
 def probe(path):
     out = subprocess.check_output(
-        f'ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate '
+        f'ffprobe -v error -select_streams v:0 '
+        f'-show_entries stream=width,height,r_frame_rate:stream_tags=rotate:stream_side_data=rotation '
         f'-of json "{path}"', shell=True)
     s = json.loads(out)["streams"][0]
     n, d = s["r_frame_rate"].split("/")
-    return int(s["width"]), int(s["height"]), float(n) / float(d)
+    w, h = int(s["width"]), int(s["height"])
+    # Вертикальные видео с iPhone хранятся горизонтально + метка поворота
+    rot = s.get("tags", {}).get("rotate")
+    for sd in s.get("side_data_list", []):
+        rot = sd.get("rotation", rot)
+    if rot is not None and abs(int(float(rot))) % 180 == 90:
+        w, h = h, w
+    return w, h, float(n) / float(d)
 
 def work_size(w, h):
     k = MAX_SIDE / max(w, h)
