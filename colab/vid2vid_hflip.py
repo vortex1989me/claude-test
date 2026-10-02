@@ -60,7 +60,10 @@ pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
     safety_checker=None, requires_safety_checker=False,
 ).to(DEV)
 pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-pipe.enable_vae_slicing()
+try:
+    pipe.vae.enable_slicing()  # в новых diffusers pipe.enable_vae_slicing() удалён
+except AttributeError:
+    pass
 pipe.set_progress_bar_config(disable=True)
 
 depth_est = hf_pipeline("depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf", device=0)
