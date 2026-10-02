@@ -1,7 +1,19 @@
 # Video Uniqualizer
 
-`video_uniqualizer.py` делает из одного видео N уникальных копий через FFmpeg.
+`new.py` делает из одного видео N уникальных копий через FFmpeg.
 Промпт, по которому он написан, лежит в [`PROMPT.md`](PROMPT.md).
+
+## Структура папок
+
+```
+C:\Unic\15.09(CLAUDE)\
+├── new.py
+├── input_videos\    <- исходные видео
+└── output_videos\   <- готовые копии
+```
+
+Без аргументов скрипт берёт все видео из `input_videos` и сохраняет результат в `output_videos`
+(обе папки ищутся рядом с `new.py`, откуда бы его ни запустили). В Windows можно запускать двойным кликом.
 
 ## Что меняется
 
@@ -23,11 +35,11 @@ pip install numpy   # для подсчёта pHash
 ## Примеры
 
 ```bash
-python video_uniqualizer.py input.mp4
-python video_uniqualizer.py input.mp4 -n 5 --intensity high -o out/ --report report.json
-python video_uniqualizer.py videos/ -n 3 --min-phash 10 --seed 42
-python video_uniqualizer.py input.mp4 --codec h265 --format mkv
-python video_uniqualizer.py input.mp4 --dry-run          # только показать команду ffmpeg
+python new.py                                   # input_videos -> output_videos, по 1 копии
+python new.py -n 5 --intensity high --report report.json
+python new.py -n 3 --min-phash 10 --seed 42
+python new.py --codec h265 --format mkv
+python new.py input_videos/clip.mp4 --dry-run   # только показать команду ffmpeg
 ```
 
 Все случайные параметры берутся из `--seed` и сохраняются в JSON-отчёт.

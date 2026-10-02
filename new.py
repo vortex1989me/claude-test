@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-video_uniqualizer.py — уникализация видео через FFmpeg.
+new.py — уникализация видео через FFmpeg.
+
+Структура папок (рядом со скриптом):
+  new.py
+  input_videos/   <- сюда кладём исходные видео
+  output_videos/  <- сюда попадают уникализированные копии
 
 Что меняется (каждая копия получает свой набор случайных параметров из seed):
   * Визуал (pHash)      — микро-кроп, микро-поворот, цвет/гамма/оттенок, шум, резкость,
@@ -15,10 +20,10 @@ video_uniqualizer.py — уникализация видео через FFmpeg.
 проверка pHash пропускается).
 
 Примеры:
-  python video_uniqualizer.py input.mp4
-  python video_uniqualizer.py input.mp4 -n 5 --intensity high -o out/
-  python video_uniqualizer.py videos/ -n 3 --min-phash 6 --seed 42
-  python video_uniqualizer.py input.mp4 --codec h265 --dry-run
+  python new.py                                  # все видео из input_videos -> output_videos
+  python new.py -n 5 --intensity high
+  python new.py -n 3 --min-phash 6 --seed 42
+  python new.py input_videos/clip.mp4 --codec h265 --dry-run
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
 import random
 import shutil
 import subprocess
@@ -41,6 +47,10 @@ try:
     import numpy as np
 except ImportError:  # pHash станет недоступен, остальное работает
     np = None
+
+BASE_DIR = Path(__file__).resolve().parent
+INPUT_DIR = BASE_DIR / "input_videos"
+OUTPUT_DIR = BASE_DIR / "output_videos"
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv", ".ts", ".wmv"}
 
@@ -521,8 +531,10 @@ def print_summary(r: dict) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Уникализация видео: pHash, MD5/SHA-256, Lanczos micro-scaling, custom AQ/CQM.")
-    ap.add_argument("input", type=Path, help="видеофайл или папка")
-    ap.add_argument("-o", "--output", type=Path, default=Path("uniq_out"), help="папка вывода")
+    ap.add_argument("input", type=Path, nargs="?", default=INPUT_DIR,
+                    help="видеофайл или папка (по умолчанию input_videos рядом со скриптом)")
+    ap.add_argument("-o", "--output", type=Path, default=OUTPUT_DIR,
+                    help="папка вывода (по умолчанию output_videos рядом со скриптом)")
     ap.add_argument("-n", "--copies", type=int, default=1, help="копий на каждый исходник")
     ap.add_argument("--intensity", choices=INTENSITY, default="medium")
     ap.add_argument("--strength", type=float, default=1.0, help="множитель силы (0.5–2.0)")
@@ -546,9 +558,11 @@ def main() -> None:
     if np is None and not args.no_verify:
         log("Внимание: numpy не установлен — pHash не будет посчитан (pip install numpy).")
 
+    if args.input == INPUT_DIR:
+        INPUT_DIR.mkdir(exist_ok=True)
     sources = collect_inputs(args.input)
     if not sources:
-        sys.exit("Нет видеофайлов для обработки.")
+        sys.exit(f"Нет видеофайлов для обработки в {args.input}")
     args.output.mkdir(parents=True, exist_ok=True)
     master = random.Random(args.seed)
 
@@ -571,4 +585,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # запуск двойным кликом в Windows: не закрывать окно сразу
+        if os.name == "nt" and len(sys.argv) == 1 and sys.stdin and sys.stdin.isatty():
+            input("\nНажмите Enter для выхода...")
