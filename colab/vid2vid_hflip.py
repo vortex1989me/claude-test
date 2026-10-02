@@ -1,7 +1,7 @@
 # ==============================================================================
 #  Vid2Vid restyle для Google Colab (GPU T4) — ОДНА ЯЧЕЙКА, просто запусти.
 #  Drive: Мой диск/Colab Notebooks/content/input_videos  ->  .../output_iphone
-#  Пайплайн: HFLIP -> SD1.5 + LCM-LoRA (быстро, 3 шага) + ControlNet Tile (+Depth опц.)
+#  Пайплайн: HFLIP -> SD1.5 + ускоряющая LoRA (3 шага) + ControlNet Tile (+Depth опц.)
 #            -> оптический поток (Farneback) для временной стабильности
 #            -> сборка обратно в mp4 с оригинальным звуком
 # ==============================================================================
@@ -14,7 +14,6 @@ OUTPUT_DIR = f"{BASE_DIR}/output_iphone"
 PROMPT     = "high quality photo, natural lighting, detailed textures, sharp focus"
 
 STRENGTH       = 0.30   # сила перерисовки: 0.2–0.4 (выше = сильнее отличие, больше мерцания)
-STEPS          = 10     # с LCM реально выполняется STEPS*STRENGTH = 3 шага
 TILE_SCALE     = 0.60   # вес ControlNet Tile (держит детали/цвета)
 USE_DEPTH      = False  # True = + ControlNet Depth (точнее геометрия, но ~1.5x медленнее)
 DEPTH_SCALE    = 0.45
@@ -42,7 +41,8 @@ sh(f"{sys.executable} -m pip -q install -U diffusers transformers accelerate pef
 import cv2, numpy as np, torch
 from PIL import Image
 from tqdm.auto import tqdm
-from diffusers import StableDiffusionControlNetImg2ImgPipeline, ControlNetModel, LCMScheduler
+from diffusers import (StableDiffusionControlNetImg2ImgPipeline, ControlNetModel, LCMScheduler,
+                       DDIMScheduler, UniPCMultistepScheduler)
 
 assert torch.cuda.is_available(), "Нет GPU: Среда выполнения -> Сменить среду -> T4 GPU"
 DEV = "cuda"
@@ -64,10 +64,31 @@ pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
     controlnet=controlnet, torch_dtype=torch.float16,
     safety_checker=None, requires_safety_checker=False,
 ).to(DEV)
-# LCM-LoRA: 3 шага вместо ~8 и без CFG (ещё x2) — главный источник ускорения
-pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-pipe.load_lora_weights("latent-consistency/lcm-lora-sdv15")
-pipe.fuse_lora()
+# Ускоряющая LoRA: ~3 шага и без CFG. Пробуем по очереди; если ни одна не скачалась —
+# работаем без неё (UniPC, 4 шага, без CFG) — чуть медленнее, но всё равно быстро.
+base_sched = pipe.scheduler.config
+FAST_LORAS = [
+    ("LCM-LoRA",     "latent-consistency/lcm-lora-sdv15", None,
+     lambda: LCMScheduler.from_config(base_sched), 10),
+    ("Hyper-SD 8st", "ByteDance/Hyper-SD", "Hyper-SD15-8steps-lora.safetensors",
+     lambda: DDIMScheduler.from_config(base_sched, timestep_spacing="trailing"), 10),
+]
+for name, repo, weight, make_sched, steps in FAST_LORAS:
+    try:
+        kw = {"weight_name": weight} if weight else {}
+        pipe.load_lora_weights(repo, **kw)
+        pipe.fuse_lora()
+        pipe.scheduler, STEPS = make_sched(), steps
+        print(f"Ускорение: {name}")
+        break
+    except Exception as e:
+        print(f"{name} недоступна ({type(e).__name__}), пробую следующий вариант")
+        try: pipe.unload_lora_weights()
+        except Exception: pass
+else:
+    pipe.scheduler = UniPCMultistepScheduler.from_config(base_sched)
+    STEPS = 15  # 15 * 0.3 = 4 шага
+    print("Ускоряющие LoRA недоступны — режим UniPC (4 шага)")
 try:
     pipe.vae.enable_slicing()  # в новых diffusers pipe.enable_vae_slicing() удалён
 except AttributeError:
