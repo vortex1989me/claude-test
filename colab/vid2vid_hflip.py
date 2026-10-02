@@ -1,8 +1,9 @@
 # ==============================================================================
 #  Vid2Vid restyle для Google Colab (GPU T4) — ОДНА ЯЧЕЙКА, просто запусти.
 #  Drive: Мой диск/Colab Notebooks/content/input_videos  ->  .../output_iphone
-#  Пайплайн: HFLIP -> SD1.5 + ускоряющая LoRA (3 шага) + ControlNet Tile (+Depth опц.)
-#            -> оптический поток (Farneback) для временной стабильности
+#  Пайплайн: HFLIP -> SD1.5 img2img + ControlNet Tile (лёгкая перерисовка текстур)
+#            -> временное сглаживание ГОТОВЫХ кадров по оптическому потоку
+#            -> полное разрешение + возврат мелких деталей оригинала (без мыла)
 #            -> сборка обратно в mp4 с оригинальным звуком
 # ==============================================================================
 
@@ -11,18 +12,18 @@ BASE_DIR   = "/content/drive/MyDrive/Colab Notebooks/content"
 INPUT_DIR  = f"{BASE_DIR}/input_videos"
 OUTPUT_DIR = f"{BASE_DIR}/output_iphone"
 
-PROMPT     = "high quality photo, natural lighting, detailed textures, sharp focus"
+PROMPT     = "photo of a person, natural skin texture, realistic, high quality, sharp focus"
 
-STRENGTH       = 0.30   # сила перерисовки: 0.2–0.4 (выше = сильнее отличие, больше мерцания)
-TILE_SCALE     = 0.60   # вес ControlNet Tile (держит детали/цвета)
-USE_DEPTH      = False  # True = + ControlNet Depth (точнее геометрия, но ~1.5x медленнее)
-DEPTH_SCALE    = 0.45
-SEED           = 42     # одинаковый шум на всех кадрах = меньше мерцания
-FLOW_BLEND     = 0.30   # доля предыдущего (сгенерированного и сдвинутого потоком) кадра
-SCENE_CUT_DIFF = 35.0   # порог смены сцены (на склейке поток не применяется)
-MAX_SIDE       = 640    # рабочее разрешение по длинной стороне (512 = быстрее, 768 = детальнее)
+STRENGTH       = 0.22   # сила перерисовки: 0.15–0.30. Выше 0.3 — появляются выдуманные детали
+STEPS          = 20     # реально выполняется STEPS*STRENGTH ≈ 4 шага
+TILE_SCALE     = 1.00   # вес ControlNet Tile: держит детали (тату, текст, фон) на месте
+SMOOTH         = 0.15   # сглаживание мерцания: доля предыдущего готового кадра (0 = выкл, 0.3 макс)
+DETAIL         = 1.00   # резкость: сколько мелких деталей вернуть с оригинала (0 = мыло, 1 = как в оригинале)
+SCENE_CUT_DIFF = 35.0   # порог смены сцены (на склейке сглаживание не применяется)
+SHORT_SIDE     = 512    # рабочее разрешение по КОРОТКОЙ стороне. 512 = родное для SD1.5 (448 = быстрее, хуже лица)
 MAX_FPS        = 30     # если исходник 60 fps — обработаем 30
 CRF            = 17     # качество итогового x264 (меньше = лучше)
+TEST_SECONDS   = 0      # >0 = обработать только первые N секунд (быстрый тест настроек)
 # ------------------------------------------------------------------------------
 
 import os, sys, glob, json, shutil, subprocess, time
@@ -36,59 +37,25 @@ drive.mount("/content/drive")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 2) Зависимости
-sh(f"{sys.executable} -m pip -q install -U diffusers transformers accelerate peft opencv-python-headless")
+sh(f"{sys.executable} -m pip -q install -U diffusers transformers accelerate opencv-python-headless")
 
 import cv2, numpy as np, torch
 from PIL import Image
 from tqdm.auto import tqdm
-from diffusers import (StableDiffusionControlNetImg2ImgPipeline, ControlNetModel, LCMScheduler,
-                       DDIMScheduler, UniPCMultistepScheduler)
+from diffusers import StableDiffusionControlNetImg2ImgPipeline, ControlNetModel, UniPCMultistepScheduler
 
 assert torch.cuda.is_available(), "Нет GPU: Среда выполнения -> Сменить среду -> T4 GPU"
 DEV = "cuda"
-torch.backends.cuda.matmul.allow_tf32 = True
 
 # 3) Модели
 print("Загрузка моделей...")
 cn_tile = ControlNetModel.from_pretrained("lllyasviel/control_v11f1e_sd15_tile", torch_dtype=torch.float16)
-if USE_DEPTH:
-    from transformers import pipeline as hf_pipeline
-    cn_depth = ControlNetModel.from_pretrained("lllyasviel/control_v11f1p_sd15_depth", torch_dtype=torch.float16)
-    controlnet = [cn_tile, cn_depth]
-    depth_est = hf_pipeline("depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf", device=0)
-else:
-    controlnet = cn_tile
-
 pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
     "stable-diffusion-v1-5/stable-diffusion-v1-5",
-    controlnet=controlnet, torch_dtype=torch.float16,
+    controlnet=cn_tile, torch_dtype=torch.float16,
     safety_checker=None, requires_safety_checker=False,
 ).to(DEV)
-# Ускоряющая LoRA: ~3 шага и без CFG. Пробуем по очереди; если ни одна не скачалась —
-# работаем без неё (UniPC, 4 шага, без CFG) — чуть медленнее, но всё равно быстро.
-base_sched = pipe.scheduler.config
-FAST_LORAS = [
-    ("LCM-LoRA",     "latent-consistency/lcm-lora-sdv15", None,
-     lambda: LCMScheduler.from_config(base_sched), 10),
-    ("Hyper-SD 8st", "ByteDance/Hyper-SD", "Hyper-SD15-8steps-lora.safetensors",
-     lambda: DDIMScheduler.from_config(base_sched, timestep_spacing="trailing"), 10),
-]
-for name, repo, weight, make_sched, steps in FAST_LORAS:
-    try:
-        kw = {"weight_name": weight} if weight else {}
-        pipe.load_lora_weights(repo, **kw)
-        pipe.fuse_lora()
-        pipe.scheduler, STEPS = make_sched(), steps
-        print(f"Ускорение: {name}")
-        break
-    except Exception as e:
-        print(f"{name} недоступна ({type(e).__name__}), пробую следующий вариант")
-        try: pipe.unload_lora_weights()
-        except Exception: pass
-else:
-    pipe.scheduler = UniPCMultistepScheduler.from_config(base_sched)
-    STEPS = 15  # 15 * 0.3 = 4 шага
-    print("Ускоряющие LoRA недоступны — режим UniPC (4 шага)")
+pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 try:
     pipe.vae.enable_slicing()  # в новых diffusers pipe.enable_vae_slicing() удалён
 except AttributeError:
@@ -110,12 +77,12 @@ def probe(path):
         rot = sd.get("rotation", rot)
     if rot is not None and abs(int(float(rot))) % 180 == 90:
         w, h = h, w
-    # iPhone по умолчанию снимает в HDR (HLG/Dolby Vision) — без тонмаппинга цвета будут блёклыми
+    # iPhone может снимать в HDR (HLG/Dolby Vision) — без тонмаппинга цвета будут блёклыми
     hdr = s.get("color_transfer") in ("arib-std-b67", "smpte2084")
     return w, h, float(n) / float(d), hdr
 
 def work_size(w, h):
-    k = MAX_SIDE / max(w, h)
+    k = SHORT_SIDE / min(w, h)
     return max(8, int(w * k) // 8 * 8), max(8, int(h * k) // 8 * 8)
 
 def has_audio(path):
@@ -140,50 +107,57 @@ def process_video(src, dst):
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(f"{tmp}/in"); os.makedirs(f"{tmp}/out")
 
-    # HFLIP + (HDR->SDR) + масштаб + fps — сразу при извлечении кадров
-    base_vf = f"hflip,fps={fps},scale={ww}:{wh}:flags=lanczos"
+    # HFLIP + (HDR->SDR) + fps — кадры в ПОЛНОМ разрешении (нужны для возврата резкости)
+    limit = f"-t {TEST_SECONDS}" if TEST_SECONDS > 0 else ""
+    base_vf = f"hflip,fps={fps},scale={W}:{H}"
+    sigma = max(1.0, 1.0 * W / ww)  # граница «мелких деталей», которые теряются при уменьшении
     tonemap = ("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
                "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,")
     try:
-        sh(f'ffmpeg -v error -i "{src}" -vf "{tonemap if hdr else ""}{base_vf}" -q:v 1 "{tmp}/in/%06d.png"')
+        sh(f'ffmpeg -v error {limit} -i "{src}" -vf "{tonemap if hdr else ""}{base_vf}" "{tmp}/in/%06d.bmp"')
     except subprocess.CalledProcessError:
         print("Тонмаппинг HDR недоступен, извлекаю без него")
-        for f in glob.glob(f"{tmp}/in/*.png"): os.remove(f)
-        sh(f'ffmpeg -v error -i "{src}" -vf "{base_vf}" -q:v 1 "{tmp}/in/%06d.png"')
-    frames = sorted(glob.glob(f"{tmp}/in/*.png"))
+        for f in glob.glob(f"{tmp}/in/*.bmp"): os.remove(f)
+        sh(f'ffmpeg -v error {limit} -i "{src}" -vf "{base_vf}" "{tmp}/in/%06d.bmp"')
+    frames = sorted(glob.glob(f"{tmp}/in/*.bmp"))
 
     prev_gray = prev_out = None
     for i, fp in enumerate(tqdm(frames, desc=os.path.basename(src))):
-        cur = cv2.cvtColor(cv2.imread(fp), cv2.COLOR_BGR2RGB)
-        cur_gray = cv2.cvtColor(cur, cv2.COLOR_RGB2GRAY)
-
-        init = cur
-        if prev_out is not None and np.abs(cur_gray.astype(np.float32) - prev_gray).mean() < SCENE_CUT_DIFF:
-            warped = warp(prev_out, cur_gray, prev_gray)
-            init = cv2.addWeighted(cur, 1 - FLOW_BLEND, warped, FLOW_BLEND, 0)
-
+        full = cv2.cvtColor(cv2.imread(fp), cv2.COLOR_BGR2RGB)
+        cur = cv2.resize(full, (ww, wh), interpolation=cv2.INTER_AREA)
+        cur_gray = cv2.cvtColor(cur, cv2.COLOR_RGB2GRAY).astype(np.float32)
         cur_pil = Image.fromarray(cur)
-        if USE_DEPTH:
-            depth = depth_est(cur_pil)["depth"].convert("RGB").resize((ww, wh))
-            control, scale = [cur_pil, depth], [TILE_SCALE, DEPTH_SCALE]
-        else:
-            control, scale = cur_pil, TILE_SCALE
-        g = torch.Generator(DEV).manual_seed(SEED)
-        out = pipe(
-            prompt=PROMPT, image=Image.fromarray(init), control_image=control,
-            strength=STRENGTH, num_inference_steps=STEPS, guidance_scale=1.0,
-            controlnet_conditioning_scale=scale, generator=g,
-        ).images[0]
 
+        # Каждый кадр генерируется ТОЛЬКО из оригинала (без подмешивания прошлых результатов),
+        # и шум свой на каждый кадр — так артефакты не копятся и не «прилипают» к экрану.
+        g = torch.Generator(DEV).manual_seed(i)
+        out = pipe(
+            prompt=PROMPT, image=cur_pil, control_image=cur_pil,
+            strength=STRENGTH, num_inference_steps=STEPS, guidance_scale=1.0,
+            controlnet_conditioning_scale=TILE_SCALE, generator=g,
+        ).images[0]
         out_np = np.array(out)
-        Image.fromarray(out_np).save(f"{tmp}/out/{i + 1:06d}.png")
-        prev_out, prev_gray = out_np, cur_gray.astype(np.float32)
+
+        # Сглаживание мерцания уже готовых кадров (сдвиг предыдущего по движению)
+        if SMOOTH > 0 and prev_out is not None and np.abs(cur_gray - prev_gray).mean() < SCENE_CUT_DIFF:
+            warped = warp(prev_out, cur_gray, prev_gray)
+            out_np = cv2.addWeighted(out_np, 1 - SMOOTH, warped, SMOOTH, 0)
+
+        prev_out, prev_gray = out_np, cur_gray
+
+        # Обратно в полное разрешение + мелкие детали оригинала (ресницы, волосы, кожа) — без мыла
+        big = cv2.resize(out_np, (W, H), interpolation=cv2.INTER_LANCZOS4).astype(np.float32)
+        f32 = full.astype(np.float32)
+        hi = f32 - cv2.GaussianBlur(f32, (0, 0), sigma)
+        final = np.clip(big + DETAIL * hi, 0, 255).astype(np.uint8)
+        cv2.imwrite(f"{tmp}/out/{i + 1:06d}.bmp", cv2.cvtColor(final, cv2.COLOR_RGB2BGR))
 
     # Сборка: обратно в исходное разрешение, звук из оригинала
-    audio_in  = f'-i "{src}"' if has_audio(src) else ""
+    audio_in  = f'{limit} -i "{src}"' if has_audio(src) else ""
     audio_map = "-map 1:a:0 -c:a aac -b:a 192k -shortest" if audio_in else ""
-    sh(f'ffmpeg -v error -y -framerate {fps} -i "{tmp}/out/%06d.png" {audio_in} '
-       f'-map 0:v:0 {audio_map} -vf "scale={W}:{H}:flags=lanczos" '
+    sh(f'ffmpeg -v error -y -framerate {fps} -i "{tmp}/out/%06d.bmp" {audio_in} '
+       f'-map 0:v:0 {audio_map} -vf "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p" '
+       f'-colorspace bt709 -color_primaries bt709 -color_trc bt709 '
        f'-c:v libx264 -preset medium -crf {CRF} -pix_fmt yuv420p -movflags +faststart "{dst}"')
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"Время: {(time.time() - t0) / 60:.1f} мин")
@@ -192,10 +166,11 @@ def process_video(src, dst):
 EXTS = (".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm")
 videos = sorted(f for f in glob.glob(f"{INPUT_DIR}/*") if f.lower().endswith(EXTS))
 print(f"Найдено видео: {len(videos)}")
+suffix = "_test" if TEST_SECONDS > 0 else "_v2v"
 for src in videos:
-    dst = f"{OUTPUT_DIR}/{os.path.splitext(os.path.basename(src))[0]}_v2v.mp4"
+    dst = f"{OUTPUT_DIR}/{os.path.splitext(os.path.basename(src))[0]}{suffix}.mp4"
     if os.path.exists(dst):
-        print("Пропуск (уже есть):", dst); continue
+        print("Пропуск (уже есть, удалите файл чтобы переделать):", dst); continue
     try:
         process_video(src, dst)
         print("Готово:", dst)
