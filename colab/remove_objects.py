@@ -3,7 +3,8 @@
 #  Drive: Мой диск/Colab Notebooks/content/input_videos  ->  .../output_iphone
 #  Для каждого видео:
 #    1) HFLIP
-#    2) Находятся отдельные предметы на фоне (SAM; запасной вариант — поиск «заметных пятен»),
+#    2) Выбирается кадр, где фон виден лучше всего, на нём ищутся отдельные предметы
+#       (SAM; запасной вариант — поиск «заметных пятен»),
 #       случайные REMOVE_COUNT из них выбираются, двигающиеся предметы пропускаются
 #    3) ProPainter убирает их со ВСЕГО видео: берёт настоящий фон из тех кадров, где он виден,
 #       остальное дорисовывает — согласованно по времени, без мерцания
@@ -106,10 +107,14 @@ def sam_masks(rgb):
     if sam is None:
         return []
     from PIL import Image
-    out = sam(Image.fromarray(rgb), points_per_batch=64, pred_iou_thresh=0.7,
-              stability_score_thresh=0.8, crops_n_layers=1)
-    masks = [m.cpu().numpy() if hasattr(m, "cpu") else np.asarray(m) for m in out["masks"]]
-    return [np.squeeze(m).astype(np.uint8) for m in masks]
+    try:
+        out = sam(Image.fromarray(rgb), points_per_batch=64, pred_iou_thresh=0.7,
+                  stability_score_thresh=0.8)
+        masks = [m.cpu().numpy() if hasattr(m, "cpu") else np.asarray(m) for m in out["masks"]]
+        return [np.squeeze(m).astype(np.uint8) for m in masks]
+    except Exception as e:                                   # сбой SAM не должен останавливать видео
+        print(f"SAM не сработала ({type(e).__name__}: {str(e)[:80]}) — только поиск «заметных пятен»")
+        return []
 # <<< MODELS
 
 matter = Matter()
@@ -199,11 +204,13 @@ def blob_masks(rgb, bg):
     return [(comp == j).astype(np.uint8) for j in range(1, n)]
 
 def find_objects(frame0, alpha0, sw, shh):
+    """frame0/alpha0 — опорный кадр (где фон виден лучше всего)."""
     small = cv2.resize(frame0, (sw, shh), interpolation=cv2.INTER_AREA)
     lab_img = cv2.cvtColor(small.astype(np.float32) / 255, cv2.COLOR_RGB2Lab)
     a_s = cv2.resize(alpha0, (sw, shh))
-    person = cv2.dilate((a_s > 0.2).astype(np.uint8), np.ones((9, 9), np.uint8))
-    stats = {"SAM масок": 0, "не тот размер": 0, "на человеке": 0, "слабый контраст": 0, "подходят": 0}
+    person = cv2.dilate((a_s > 0.2).astype(np.uint8), np.ones((15, 15), np.uint8))
+    stats = {"SAM масок": 0, "не тот размер": 0, "на человеке": 0, "полоска": 0,
+             "слабый контраст": 0, "подходят": 0}
     found = []
     for src, masks in (("SAM", sam_masks(small)), ("пятна", blob_masks(small, person == 0))):
         if src == "SAM":
@@ -214,6 +221,9 @@ def find_objects(frame0, alpha0, sw, shh):
                 stats["не тот размер"] += 1; continue
             if (m & person).sum() > 0.05 * m.sum():
                 stats["на человеке"] += 1; continue
+            x, y, bw, bh = cv2.boundingRect(m)
+            if m.sum() < 0.3 * bw * bh or min(bw, bh) < 0.15 * max(bw, bh):   # тонкая полоска/контур
+                stats["полоска"] += 1; continue
             c = contrast(lab_img, m)
             if c < OBJ_MIN_CONTRAST:
                 stats["слабый контраст"] += 1; continue
@@ -231,17 +241,18 @@ def find_objects(frame0, alpha0, sw, shh):
           f"| без дублей: {len(cands)}")
     return cands, small
 
-def is_static(obj_full, frames, alphas_dir, A_list, idxs, W, H):
-    """Предмет не двигается сам (люди, машины, волны): сравнение с кадром 0 после компенсации
-    движения камеры и автоэкспозиции."""
-    f0 = cv2.cvtColor(cv2.imread(frames[0]), cv2.COLOR_BGR2RGB).astype(np.float32)
+def is_static(obj_full, frames, alphas_dir, A_list, idxs, W, H, ref):
+    """Предмет не двигается сам (люди, машины, волны): сравнение с опорным кадром после
+    компенсации движения камеры и автоэкспозиции."""
+    f0 = cv2.cvtColor(cv2.imread(frames[ref]), cv2.COLOR_BGR2RGB).astype(np.float32)
     ring = cv2.dilate(obj_full, np.ones((31, 31), np.uint8)) - obj_full
     for t in idxs:
+        M = (A_list[t] @ np.linalg.inv(A_list[ref]))[:2]          # опорный кадр -> кадр t
         ft = cv2.cvtColor(cv2.imread(frames[t]), cv2.COLOR_BGR2RGB)
-        back = cv2.warpAffine(ft, A_list[t][:2], (W, H), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+        back = cv2.warpAffine(ft, M, (W, H), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                               borderMode=cv2.BORDER_REFLECT).astype(np.float32)
         at = cv2.imread(f"{alphas_dir}/{t:06d}.png", cv2.IMREAD_GRAYSCALE)
-        at = cv2.warpAffine(at, A_list[t][:2], (W, H), flags=cv2.WARP_INVERSE_MAP) < 50
+        at = cv2.warpAffine(at, M, (W, H), flags=cv2.WARP_INVERSE_MAP) < 50
         o, r = (obj_full > 0) & at, (ring > 0) & at
         if o.sum() < 50:
             continue
@@ -343,19 +354,23 @@ def process_video(src, dst, log_rows):
             A = A_list[-1] if A is None else A
         A_list.append(A.copy())
 
-    # Выбор предметов
-    frame0 = cv2.cvtColor(cv2.imread(frames[0]), cv2.COLOR_BGR2RGB)
-    alpha0 = cv2.imread(f"{tmp}/alpha/000000.png", cv2.IMREAD_GRAYSCALE) / 255.0
-    cands, small0 = find_objects(frame0, alpha0, sw, shh)
+    # Опорный кадр: где человек закрывает меньше всего фона (просматриваем всё видео)
+    areas = [(cv2.imread(f"{tmp}/alpha/{i:06d}.png", cv2.IMREAD_GRAYSCALE) > 128).mean()
+             for i in range(0, n, max(1, n // 40))]
+    ref = int(np.argmin(areas)) * max(1, n // 40)
+    print(f"Опорный кадр: {ref} (человек занимает {100 * min(areas):.0f}% кадра)")
+    frame_r = cv2.cvtColor(cv2.imread(frames[ref]), cv2.COLOR_BGR2RGB)
+    alpha_r = cv2.imread(f"{tmp}/alpha/{ref:06d}.png", cv2.IMREAD_GRAYSCALE) / 255.0
+    cands, small0 = find_objects(frame_r, alpha_r, sw, shh)
     order = list(range(min(len(cands), 4 * REMOVE_COUNT)))      # из самых заметных — случайные
     random.shuffle(order)
-    idxs = sorted({n // 3, 2 * n // 3, n - 1} - {0})
+    idxs = sorted({0, n // 3, 2 * n // 3, n - 1} - {ref})
     removed, moving = [], 0
     for i in order:
         if len(removed) >= REMOVE_COUNT:
             break
         obj_full = cv2.resize(cands[i][2], (W, H), interpolation=cv2.INTER_NEAREST)
-        if is_static(obj_full, frames, f"{tmp}/alpha", A_list, idxs, W, H):
+        if is_static(obj_full, frames, f"{tmp}/alpha", A_list, idxs, W, H, ref):
             removed.append(i)
         else:
             moving += 1
@@ -370,6 +385,8 @@ def process_video(src, dst, log_rows):
         obj0 |= cv2.resize(cands[i][2], (W, H), interpolation=cv2.INTER_NEAREST)
     if removed:
         obj0 = cv2.dilate(obj0, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)))
+        # маска найдена на опорном кадре — переводим её в координаты кадра 0
+        obj0 = cv2.warpAffine(obj0, np.linalg.inv(A_list[ref])[:2], (W, H), flags=cv2.INTER_NEAREST)
 
     # ProPainter: кадры + маски в рабочем разрешении, по кускам
     pp_frames = None
