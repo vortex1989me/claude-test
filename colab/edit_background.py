@@ -3,9 +3,9 @@
 #  Drive: Мой диск/Colab Notebooks/content/input_videos  ->  .../output_iphone
 #  Для каждого видео:
 #    1) HFLIP
-#    2) Нейросеть находит предметы на фоне и УБИРАЕТ несколько случайных (LaMa дорисовывает
-#       стену/полку/асфальт за ними). Двигающиеся предметы (люди, машины, волны) не трогаются.
-#    3) Стены (и фасады зданий на улице) перекрашиваются в случайный «настоящий» цвет краски
+#    2) Нейросеть SAM выделяет ВСЕ отдельные предметы на фоне, несколько случайных УБИРАЮТСЯ
+#       (LaMa дорисовывает стену/полку/асфальт за ними). Двигающиеся предметы не трогаются.
+#    3) Стены и потолок (фасады на улице) перекрашиваются в случайный «настоящий» цвет краски
 #    4) Одежда перекрашивается в случайный цвет (лицо, волосы, кожа, тату не трогаются)
 #    5) Всё остальное — пиксели оригинала. Человек не вырезается и не вклеивается.
 #       Свет/тени/экспозиция в правленых местах берутся из оригинала кадр за кадром.
@@ -24,7 +24,8 @@ OBJ_MAX_AREA   = 0.06   # ...до 6% кадра (крупное мебель/м�
 RECOLOR_WALLS  = True   # перекрашивать стены / фасады
 RECOLOR_CLOTHES = True  # перекрашивать одежду (вся одежда — один случайный цвет, без пятен)
 CLOTHES_CHROMA = (25, 50)  # насыщенность нового цвета одежды (от, до)
-WALL_CHROMA_MIN = 22    # минимальная насыщенность цвета стен (больше = заметнее)
+WALL_CHROMA_MIN = 26    # минимальная насыщенность цвета стен (больше = заметнее)
+OBJ_MIN_CONTRAST = 10   # предмет должен заметно отличаться от окружения (меньше = убирать и неприметное)
 WALL_LIGHTNESS = True   # менять и светлоту стен (тёмная серая -> светлая цветная, как новая краска)
 DEBUG_IMAGE    = True   # сохранять картинку-отчёт: что нашла нейросеть и что выбрано для удаления
 STABILITY      = 0.70   # сглаживание масок по времени (0 = выкл, 0.9 = макс)
@@ -40,7 +41,7 @@ REMOVABLE = ("painting", "poster", "picture", "box", "bottle", "vase", "lamp", "
              "fan", "tray", "plate", "glass", "ball", "bicycle", "minibike", "bench", "stool", "chair",
              "bulletin board", "monitor", "television", "computer", "microwave", "sculpture",
              "streetlight", "traffic light", "car", "van", "truck", "boat", "palm", "umbrella", "food")
-WALLS = ("wall", "building", "house", "skyscraper")
+WALLS = ("wall", "ceiling", "building", "house", "skyscraper")
 # «Строительные» классы — их не убираем (всё остальное на фоне — запасные кандидаты на удаление)
 STRUCTURE = ("wall", "building", "floor", "ceiling", "sky", "road", "sidewalk", "ground", "earth",
              "grass", "sand", "sea", "water", "river", "lake", "mountain", "hill", "field", "land",
@@ -89,6 +90,23 @@ scene_model = load_first(_seg, ["nvidia/segformer-b2-finetuned-ade-512-512",
                                 "nvidia/segformer-b0-finetuned-ade-512-512"], "Предметы/стены")
 PERSON_LABELS = {int(k): v.lower() for k, v in person_model.config.id2label.items()}
 SCENE_LABELS  = {int(k): v.lower().strip() for k, v in scene_model.config.id2label.items()}
+
+# SAM — выделяет все отдельные предметы в кадре, без привязки к названиям
+from transformers import pipeline as hf_pipeline
+try:
+    sam = hf_pipeline("mask-generation", model="facebook/sam-vit-base", device=0)
+    print("Поиск предметов: SAM")
+except Exception as e:
+    sam = None
+    print(f"SAM недоступна ({type(e).__name__}) — предметы ищутся только по классам")
+
+def object_masks(rgb):
+    """Все маски предметов (0/1, размер rgb). Пустой список, если SAM недоступна."""
+    if sam is None:
+        return []
+    from PIL import Image
+    out = sam(Image.fromarray(rgb), points_per_batch=64)
+    return [np.asarray(m).astype(np.uint8) for m in out["masks"]]
 
 # LaMa — нейросеть для удаления предметов (дорисовывает фон продолжением текстуры)
 LAMA_URL = "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"
@@ -282,13 +300,41 @@ def norm_blur(img, weight, sigma):
     return num / np.maximum(den, 1e-3)
 
 # 3) Выбор и удаление предметов (один раз на видео, по кадру 0)
+def contrast(lab_img, obj):
+    """Насколько предмет отличается по цвету от полоски вокруг него (ΔE в Lab)."""
+    ring = cv2.dilate(obj, np.ones((15, 15), np.uint8)) - obj
+    if ring.sum() < 20 or obj.sum() < 20:
+        return 0.0
+    return float(np.linalg.norm(lab_img[obj > 0].mean(0) - lab_img[ring > 0].mean(0)))
+
 def pick_objects(frame0, alpha0, sw, shh):
     small = cv2.resize(frame0, (sw, shh), interpolation=cv2.INTER_AREA)
+    lab_img = cv2.cvtColor(small.astype(np.float32) / 255, cv2.COLOR_RGB2Lab)
     sp = scene_probs(small)
     lab = sp.argmax(-1)
     a_s = cv2.resize(alpha0, (sw, shh))
     person = cv2.dilate((a_s > 0.2).astype(np.uint8), np.ones((7, 7), np.uint8))
-    cands = []
+    cands, taken = [], np.zeros((shh, sw), np.uint8)
+    # 1) SAM: любые отдельные предметы, сначала самые заметные
+    sam_list = []
+    for m in object_masks(small):
+        area = m.sum() / (sw * shh)
+        if not (OBJ_MIN_AREA <= area <= OBJ_MAX_AREA):
+            continue
+        if (m & person).sum() > 0.05 * m.sum():                # на человеке / вплотную за ним
+            continue
+        c = contrast(lab_img, m)                               # однотонный кусок стены сюда не пройдёт
+        if c >= OBJ_MIN_CONTRAST:
+            sam_list.append((c, area, m))
+    sam_list.sort(key=lambda x: -x[0])
+    for c, area, m in sam_list:
+        if (m & taken).sum() > 0.3 * m.sum():                  # уже выбран вложенный/соседний кусок
+            continue
+        taken |= m
+        cls = np.bincount(lab[m > 0], minlength=len(SCENE_LABELS)).argmax()
+        name = SCENE_LABELS[int(cls)].split(";")[0]
+        cands.append((name if int(cls) not in S_WALL else "предмет", m, area, 0))
+    # 2) запасной вариант: предметы по классам модели интерьера
     for c in set(np.unique(lab).tolist()) & set(S_REMOVE + S_OTHER):
         m = ((lab == c) & (person == 0)).astype(np.uint8)
         n, comp, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
@@ -300,6 +346,8 @@ def pick_objects(frame0, alpha0, sw, shh):
             # Предмет не должен заметно прятаться за человеком (иначе дорисовка ненадёжна)
             ring = cv2.dilate(obj, np.ones((9, 9), np.uint8)) - obj
             if (ring * (a_s > 0.2)).sum() > 0.5 * max(ring.sum(), 1):
+                continue
+            if (obj & taken).sum() > 0.3 * obj.sum():
                 continue
             tier = 1 if c in S_REMOVE else 2                  # 1 — мелкие предметы, 2 — запасные
             cands.append((SCENE_LABELS[c].split(";")[0], obj, area, tier))
@@ -429,10 +477,13 @@ def process_video(src, dst, log_rows):
     labmap, moving = None, []
     if REMOVE_COUNT > 0 and not shaky:
         cands, labmap = pick_objects(frame0, alpha0, sw, shh)
-        random.shuffle(cands)
-        cands.sort(key=lambda c: c[3])                     # сначала мелкие предметы, потом запасные
-        print(f"Кандидатов на удаление: {sum(c[3] == 1 for c in cands)} предметов + "
-              f"{sum(c[3] == 2 for c in cands)} запасных")
+        top = [c for c in cands if c[3] == 0][:3 * REMOVE_COUNT]   # самые заметные от SAM...
+        random.shuffle(top)                                        # ...в случайном порядке
+        rest = [c for c in cands if c[3] != 0]
+        random.shuffle(rest)
+        cands = top + sorted(rest, key=lambda c: c[3])
+        print(f"Кандидатов на удаление: SAM {len(top)}, по классам {sum(c[3] == 1 for c in cands)}, "
+              f"запасных {sum(c[3] == 2 for c in cands)}")
         idxs = sorted({n // 3, 2 * n // 3, n - 1} - {0})
         for name, obj, area, tier in cands:
             if len(removed) >= REMOVE_COUNT:
@@ -457,11 +508,20 @@ def process_video(src, dst, log_rows):
 
     # Цвета на это видео
     wall_hex = random.choice(WALL_COLORS)
-    wd = hex_dir(wall_hex)
     wall_gain = 1.0
+    if S_WALL:
+        small0 = cv2.resize(frame0, (sw, shh), interpolation=cv2.INTER_AREA)
+        sp0 = scene_probs(small0)
+        wm = (sp0[..., S_WALL].sum(-1) > 0.4) & (cv2.resize(alpha0, (sw, shh)) < 0.2)
+        if wm.sum() > 100:                                 # цвет краски — заметно другой, чем был
+            lab0 = cv2.cvtColor(small0.astype(np.float32) / 255, cv2.COLOR_RGB2Lab)[wm].mean(0)
+            def far(hx):
+                rgb = np.array([[[int(hx[i:i + 2], 16) for i in (1, 3, 5)]]], np.float32) / 255
+                return float(np.linalg.norm(cv2.cvtColor(rgb, cv2.COLOR_RGB2Lab)[0, 0] - lab0))
+            good = [h for h in WALL_COLORS if far(h) > 25]
+            wall_hex = random.choice(good or WALL_COLORS)
+    wd = hex_dir(wall_hex)
     if WALL_LIGHTNESS and S_WALL:                         # насколько новая краска светлее старой
-        sp0 = scene_probs(cv2.resize(frame0, (sw, shh), interpolation=cv2.INTER_AREA))
-        wm = (sp0[..., S_WALL].sum(-1) > 0.5) & (cv2.resize(alpha0, (sw, shh)) < 0.2)
         if wm.sum() > 100:
             lin0 = (cv2.resize(frame0, (sw, shh)).astype(np.float32) / 255) ** 2.2
             y_wall = (lin0[wm] @ np.array([0.2126, 0.7152, 0.0722], np.float32)).mean()
@@ -502,7 +562,7 @@ def process_video(src, dst, log_rows):
         a_s = cv2.resize(alpha, (sw, shh))
         tgt = np.zeros((shh, sw, 4), np.float32); wsum = np.zeros((shh, sw), np.float32)
         if RECOLOR_WALLS and S_WALL:
-            pw = scene_probs(small)[..., S_WALL].sum(-1) * (1 - a_s)
+            pw = np.clip((scene_probs(small)[..., S_WALL].sum(-1) - 0.25) / 0.35, 0, 1) * (1 - a_s)
             tgt += pw[..., None] * wall_c; wsum += pw; wall_area += pw.sum()
         if RECOLOR_CLOTHES:
             pp = person_probs(cv2.resize(orig, (sw, shh), interpolation=cv2.INTER_AREA))
