@@ -22,8 +22,11 @@ REMOVE_COUNT   = 3      # сколько предметов убирать (ес
 OBJ_MIN_AREA   = 0.002  # размер предмета: от 0.2% кадра...
 OBJ_MAX_AREA   = 0.06   # ...до 6% кадра (крупное мебель/машины дорисовываются хуже)
 RECOLOR_WALLS  = True   # перекрашивать стены / фасады
-RECOLOR_CLOTHES = True  # перекрашивать одежду
-CLOTHES_CHROMA = (25, 50)  # насыщенность новых цветов одежды (от, до)
+RECOLOR_CLOTHES = True  # перекрашивать одежду (вся одежда — один случайный цвет, без пятен)
+CLOTHES_CHROMA = (25, 50)  # насыщенность нового цвета одежды (от, до)
+WALL_CHROMA_MIN = 22    # минимальная насыщенность цвета стен (больше = заметнее)
+WALL_LIGHTNESS = True   # менять и светлоту стен (тёмная серая -> светлая цветная, как новая краска)
+DEBUG_IMAGE    = True   # сохранять картинку-отчёт: что нашла нейросеть и что выбрано для удаления
 STABILITY      = 0.70   # сглаживание масок по времени (0 = выкл, 0.9 = макс)
 SEG_SHORT_SIDE = 512    # разрешение для нейросетей по короткой стороне
 MAX_FPS        = 30     # если исходник 60 fps — обработаем 30
@@ -38,6 +41,11 @@ REMOVABLE = ("painting", "poster", "picture", "box", "bottle", "vase", "lamp", "
              "bulletin board", "monitor", "television", "computer", "microwave", "sculpture",
              "streetlight", "traffic light", "car", "van", "truck", "boat", "palm", "umbrella", "food")
 WALLS = ("wall", "building", "house", "skyscraper")
+# «Строительные» классы — их не убираем (всё остальное на фоне — запасные кандидаты на удаление)
+STRUCTURE = ("wall", "building", "floor", "ceiling", "sky", "road", "sidewalk", "ground", "earth",
+             "grass", "sand", "sea", "water", "river", "lake", "mountain", "hill", "field", "land",
+             "house", "skyscraper", "person", "windowpane", "door", "stairs", "stairway", "step",
+             "path", "runway", "dirt track", "tree", "fence", "railing", "column", "bridge", "rock")
 # Цвета стен — реальные цвета краски (случайный на видео)
 WALL_COLORS = ["#9caf88", "#d8a7a7", "#d9c7a7", "#9fb4c7", "#c77b58", "#a8d5ba", "#b8a9c9",
                "#8a8f5c", "#d6c29a", "#8cbfbf", "#e8d7a0", "#e9b49a", "#a3b8a0", "#c9b6a6"]
@@ -142,6 +150,8 @@ P_KEEP = [i for i, n in PERSON_LABELS.items() if any(w in n for w in KEEP_WORDS)
 P_RECOLOR = [i for i in PERSON_LABELS if i not in P_BG + P_KEEP]
 S_WALL = [i for i, n in SCENE_LABELS.items() if any(n.split(";")[0].strip() == w for w in WALLS)]
 S_REMOVE = [i for i, n in SCENE_LABELS.items() if any(w in n for w in REMOVABLE)]
+S_OTHER = [i for i, n in SCENE_LABELS.items()
+           if i not in S_REMOVE and n.split(";")[0].strip() not in STRUCTURE]
 print("Стены:", [SCENE_LABELS[i] for i in S_WALL])
 
 # 2) Утилиты
@@ -205,11 +215,19 @@ def fill_holes(mask, max_frac=0.03):
             out[lab == k] = 1
     return out.astype(np.float32)
 
+def per_ch(fn, arr):
+    """OpenCV-функции надёжно работают до 4 каналов — применяем по частям."""
+    return np.dstack([fn(np.ascontiguousarray(arr[..., i:i + 4])) for i in range(0, arr.shape[-1], 4)])
+
 def recolor(rgb, ctrl):
-    """Меняет оттенок, сохраняя яркость (складки, тени, фактура остаются)."""
-    lab = cv2.cvtColor(rgb.astype(np.float32) / 255.0, cv2.COLOR_RGB2Lab)
+    """Меняет цвет, сохраняя складки, тени и фактуру. ctrl: (da, db, chroma_min, gain, weight).
+    gain — множитель светлоты «краски» (1 = яркость не меняется)."""
+    da, db, cmin, gain, w = (ctrl[..., i] for i in range(5))
+    x = rgb.astype(np.float32) / 255.0
+    lin = x ** 2.2 * (1 + w * (gain - 1))[..., None]       # новая краска светлее/темнее
+    x = np.clip(lin, 0, 1) ** (1 / 2.2)
+    lab = cv2.cvtColor(x, cv2.COLOR_RGB2Lab)
     L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
-    da, db, cmin, w = (ctrl[..., i] for i in range(4))
     norm = np.maximum(np.hypot(da, db), 1e-6)
     da, db = da / norm, db / norm
     lum_k = np.clip(np.minimum(L, 100 - L) / 35.0, 0.25, 1.0)
@@ -271,7 +289,7 @@ def pick_objects(frame0, alpha0, sw, shh):
     a_s = cv2.resize(alpha0, (sw, shh))
     person = cv2.dilate((a_s > 0.2).astype(np.uint8), np.ones((7, 7), np.uint8))
     cands = []
-    for c in set(np.unique(lab).tolist()) & set(S_REMOVE):
+    for c in set(np.unique(lab).tolist()) & set(S_REMOVE + S_OTHER):
         m = ((lab == c) & (person == 0)).astype(np.uint8)
         n, comp, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
         for k in range(1, n):
@@ -281,10 +299,11 @@ def pick_objects(frame0, alpha0, sw, shh):
             obj = (comp == k).astype(np.uint8)
             # Предмет не должен заметно прятаться за человеком (иначе дорисовка ненадёжна)
             ring = cv2.dilate(obj, np.ones((9, 9), np.uint8)) - obj
-            if (ring * (a_s > 0.2)).sum() > 0.3 * max(ring.sum(), 1):
+            if (ring * (a_s > 0.2)).sum() > 0.5 * max(ring.sum(), 1):
                 continue
-            cands.append((SCENE_LABELS[c].split(";")[0], obj, area))
-    return cands
+            tier = 1 if c in S_REMOVE else 2                  # 1 — мелкие предметы, 2 — запасные
+            cands.append((SCENE_LABELS[c].split(";")[0], obj, area, tier))
+    return cands, lab
 
 def is_static(obj_full, frames, alphas_dir, A_list, idxs, W, H):
     """Проверка, что предмет не двигается сам (люди, машины, волны): сравниваем с кадром 0
@@ -300,12 +319,14 @@ def is_static(obj_full, frames, alphas_dir, A_list, idxs, W, H):
                               borderMode=cv2.BORDER_REFLECT).astype(np.float32)
         at = cv2.imread(f"{alphas_dir}/{t:06d}.png", cv2.IMREAD_GRAYSCALE)
         at = cv2.warpAffine(at, A_list[t][:2], (W, H), flags=cv2.WARP_INVERSE_MAP) < 50
-        d = np.abs(back - f0).mean(-1)
         o, r = (obj_full > 0) & at, (ring > 0) & at
         if o.sum() < 50:
             continue
+        if r.sum() > 50:                                   # поправка на автоэкспозицию телефона
+            back = back * (f0[r].mean(0) / np.maximum(back[r].mean(0), 1))
+        d = np.abs(back - f0).mean(-1)
         d_obj, d_ring = d[o].mean(), d[r].mean() if r.sum() > 50 else 0
-        if d_obj > 18 and d_obj > 2.5 * d_ring + 4:
+        if d_obj > 20 and d_obj > 2.5 * d_ring + 5:
             return False
     return True
 
@@ -333,6 +354,26 @@ def remove_objects(frame0, objs):
         plate[Y0:Y1, X0:X1] = (feather * res + (1 - feather) * crop).astype(np.uint8)
         total[Y0:Y1, X0:X1] = np.maximum(total[Y0:Y1, X0:X1], feather[..., 0])
     return plate, total
+
+def save_debug(frame0, alpha0, labmap, removed, W, H, path):
+    """Отчёт: цветная разметка фона нейросетью + красным обведено то, что убрано."""
+    img = frame0.copy()
+    if labmap is not None:
+        rng = np.random.RandomState(0)
+        colors = rng.randint(0, 255, (max(SCENE_LABELS) + 1, 3)).astype(np.uint8)
+        lab = cv2.resize(labmap.astype(np.uint16), (W, H), interpolation=cv2.INTER_NEAREST)
+        over = colors[lab]
+        bg = (alpha0 < 0.5)[..., None]
+        img = np.where(bg, (0.55 * img + 0.45 * over).astype(np.uint8), img)
+        for c in np.unique(labmap):                            # подписи классов
+            ys, xs = np.nonzero(lab == c)
+            if len(xs) > 0.003 * W * H:
+                cv2.putText(img, SCENE_LABELS[int(c)].split(";")[0], (int(xs.mean()), int(ys.mean())),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+    for nm, m, _ in removed:
+        cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(img, cnts, -1, (255, 0, 0), 6)
+    cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
 
 # 4) Видео целиком
 def process_video(src, dst, log_rows):
@@ -379,22 +420,30 @@ def process_video(src, dst, log_rows):
                 A = A_t
         A_list.append(A.copy())
     shift = max(np.abs(A[:2, 2]).max() for A in A_list) / min(W, H)
-    shaky = lost > 0.2 * n or shift > 0.25
+    shaky = shift > 0.25           # только если камера реально уезжает далеко (идёт, поворачивается)
 
     # Выбор и удаление предметов
     frame0 = cv2.cvtColor(cv2.imread(frames[0]), cv2.COLOR_BGR2RGB)
     alpha0 = cv2.imread(f"{tmp}/alpha/{0:06d}.png", cv2.IMREAD_GRAYSCALE) / 255.0
     removed, edit_mask, plate = [], None, None
+    labmap, moving = None, []
     if REMOVE_COUNT > 0 and not shaky:
-        cands = pick_objects(frame0, alpha0, sw, shh)
+        cands, labmap = pick_objects(frame0, alpha0, sw, shh)
         random.shuffle(cands)
+        cands.sort(key=lambda c: c[3])                     # сначала мелкие предметы, потом запасные
+        print(f"Кандидатов на удаление: {sum(c[3] == 1 for c in cands)} предметов + "
+              f"{sum(c[3] == 2 for c in cands)} запасных")
         idxs = sorted({n // 3, 2 * n // 3, n - 1} - {0})
-        for name, obj, area in cands:
+        for name, obj, area, tier in cands:
             if len(removed) >= REMOVE_COUNT:
                 break
             obj_full = cv2.resize(obj, (W, H), interpolation=cv2.INTER_NEAREST)
             if is_static(obj_full, frames, f"{tmp}/alpha", A_list, idxs, W, H):
                 removed.append((name, obj_full, area))
+            else:
+                moving.append(name)
+        if moving:
+            print("Пропущены (двигаются):", moving)
         if removed:
             plate, edit_mask = remove_objects(frame0, [(nm, m) for nm, m, _ in removed])
             cv2.imwrite(f"{OUTPUT_DIR}/{os.path.splitext(os.path.basename(dst))[0]}_cleaned_frame.jpg",
@@ -402,11 +451,26 @@ def process_video(src, dst, log_rows):
     elif shaky:
         print("Камера сильно двигается — предметы не убираю (только перекраска)")
     print("Убрано:", [nm for nm, _, _ in removed] or "ничего")
+    if DEBUG_IMAGE:
+        save_debug(frame0, alpha0, labmap, removed, W, H,
+                   f"{OUTPUT_DIR}/{os.path.splitext(os.path.basename(dst))[0]}_debug.jpg")
 
     # Цвета на это видео
     wall_hex = random.choice(WALL_COLORS)
-    wall_c = hex_dir(wall_hex)
-    p_pal = random_palette(len(PERSON_LABELS))[P_RECOLOR]
+    wd = hex_dir(wall_hex)
+    wall_gain = 1.0
+    if WALL_LIGHTNESS and S_WALL:                         # насколько новая краска светлее старой
+        sp0 = scene_probs(cv2.resize(frame0, (sw, shh), interpolation=cv2.INTER_AREA))
+        wm = (sp0[..., S_WALL].sum(-1) > 0.5) & (cv2.resize(alpha0, (sw, shh)) < 0.2)
+        if wm.sum() > 100:
+            lin0 = (cv2.resize(frame0, (sw, shh)).astype(np.float32) / 255) ** 2.2
+            y_wall = (lin0[wm] @ np.array([0.2126, 0.7152, 0.0722], np.float32)).mean()
+            prgb = np.array([int(wall_hex[i:i + 2], 16) for i in (1, 3, 5)], np.float32) / 255
+            y_paint = (prgb ** 2.2) @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+            wall_gain = float(np.clip(y_paint / max(y_wall, 1e-3), 0.5, 2.2))
+    wall_c = np.array([wd[0], wd[1], max(wd[2], WALL_CHROMA_MIN), wall_gain], np.float32)
+    one = random_palette(1)[0]                             # вся одежда — один цвет (без пятен)
+    p_pal = np.tile(np.append(one, 1.0), (len(P_RECOLOR), 1)).astype(np.float32)
     p_area = np.zeros(len(P_RECOLOR)); wall_area = 0.0
 
     # Проход 2: сборка кадров
@@ -436,7 +500,7 @@ def process_video(src, dst, log_rows):
         small = cv2.resize(out, (sw, shh), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY).astype(np.float32)
         a_s = cv2.resize(alpha, (sw, shh))
-        tgt = np.zeros((shh, sw, 3), np.float32); wsum = np.zeros((shh, sw), np.float32)
+        tgt = np.zeros((shh, sw, 4), np.float32); wsum = np.zeros((shh, sw), np.float32)
         if RECOLOR_WALLS and S_WALL:
             pw = scene_probs(small)[..., S_WALL].sum(-1) * (1 - a_s)
             tgt += pw[..., None] * wall_c; wsum += pw; wall_area += pw.sum()
@@ -450,10 +514,11 @@ def process_video(src, dst, log_rows):
             p_area += pp[..., P_RECOLOR].reshape(-1, len(P_RECOLOR)).sum(0)
         ctrl = np.dstack([tgt / np.maximum(wsum, 1e-6)[..., None], np.clip(wsum, 0, 1)]).astype(np.float32)
         if STABILITY > 0 and prev_ctrl is not None and np.abs(gray - prev_gray).mean() < 35:
-            ctrl = STABILITY * warp_flow(prev_ctrl, flow_maps(gray, prev_gray)) + (1 - STABILITY) * ctrl
+            maps = flow_maps(gray, prev_gray)
+            ctrl = STABILITY * per_ch(lambda c: warp_flow(c, maps), prev_ctrl) + (1 - STABILITY) * ctrl
         prev_ctrl, prev_gray = ctrl, gray
-        if ctrl[..., 3].max() > 0.01:
-            out = recolor(out, cv2.resize(ctrl, (W, H), interpolation=cv2.INTER_LINEAR))
+        if ctrl[..., 4].max() > 0.01:
+            out = recolor(out, per_ch(lambda c: cv2.resize(c, (W, H), interpolation=cv2.INTER_LINEAR), ctrl))
         cv2.imwrite(f"{tmp}/out/{i + 1:06d}.bmp", cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
 
     # Сборка, звук из оригинала
@@ -469,10 +534,10 @@ def process_video(src, dst, log_rows):
     for nm, _, area in removed:
         log_rows.append([name, "убрано", nm, f"{100 * area:.1f}%", ""])
     if RECOLOR_WALLS and wall_area / total > 0.01:
-        log_rows.append([name, "стены", "wall", f"{100 * wall_area / total:.1f}%", wall_hex])
+        log_rows.append([name, "стены", f"wall, светлота x{wall_gain:.2f}", f"{100 * wall_area / total:.1f}%", wall_hex])
     for j, c in enumerate(P_RECOLOR):
         if p_area[j] / total > 0.005:
-            log_rows.append([name, "одежда", PERSON_LABELS[c], f"{100 * p_area[j] / total:.1f}%", lab_hex(p_pal[j])])
+            log_rows.append([name, "одежда", PERSON_LABELS[c], f"{100 * p_area[j] / total:.1f}%", lab_hex(p_pal[j][:3])])
     print(f"Время: {(time.time() - t0) / 60:.1f} мин")
 
 # 5) Обработка всех видео (уже готовые пропускаются — можно перезапускать)
