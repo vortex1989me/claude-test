@@ -1,18 +1,22 @@
 # ==============================================================================
-#  Удаление предметов с фона (ProPainter) + перекраска одежды — Google Colab (GPU T4), ОДНА ЯЧЕЙКА.
+#  Удаление/замена предметов на фоне + перекраска одежды — Google Colab (GPU T4), ОДНА ЯЧЕЙКА.
 #  Drive: Мой диск/Colab Notebooks/content/input_videos  ->  .../output_iphone
 #  Для каждого видео:
 #    1) HFLIP
-#    2) Выбирается кадр, где фон виден лучше всего, на нём ищутся отдельные предметы
-#       (SAM; запасной вариант — поиск «заметных пятен»),
-#       случайные REMOVE_COUNT из них выбираются, двигающиеся предметы пропускаются
+#    2) Выбирается кадр, где фон виден лучше всего, на нём ищутся ОТДЕЛЬНЫЕ НЕБОЛЬШИЕ предметы
+#       (SAM режет кадр на куски, ADE20K говорит, что это: шкафы/двери/стены/окна/кровати и т.п.
+#       не трогаются никогда; куски у края кадра, полоски и крупные области — тоже).
+#       REMOVE_COUNT — это МАКСИМУМ: если подходящих 2, уберутся 2. Двигающиеся предметы пропускаются
 #    3) Удаление: камера почти неподвижна -> LaMa дорисовывает фон на одном кадре (чётко),
 #       дальше он переносится на все кадры со светом/экспозицией оригинала;
 #       камера двигается -> ProPainter берёт настоящий фон из кадров, где он виден
+#    3б) (по желанию, только неподвижная камера) часть убранных мелких предметов заменяется
+#       новым похожим предметом (Stable Diffusion Inpainting на одном кадре + перенос на все кадры)
 #    4) Одежда (по желанию) перекрашивается в естественный цвет; лицо, волосы, кожа, тату — нет
 #    5) Всё, что не правилось, — пиксели оригинала в полном разрешении
 #  Результат называется как исходник: IMG_0038.MOV -> output_iphone/IMG_0038.mp4
-#  Отчёт: output_iphone/IMG_0038_debug.jpg (жёлтым — найденные предметы, красным — убранные)
+#  Отчёт: output_iphone/IMG_0038_debug.jpg (жёлтым — подходящие предметы, красным — убранные,
+#         зелёным — заменённые), output_iphone/IMG_0038_cleaned_frame.jpg — опорный кадр после правки
 # ==============================================================================
 
 # ----------------------------- НАСТРОЙКИ --------------------------------------
@@ -20,10 +24,12 @@ BASE_DIR   = "/content/drive/MyDrive/Colab Notebooks/content"
 INPUT_DIR  = f"{BASE_DIR}/input_videos"
 OUTPUT_DIR = f"{BASE_DIR}/output_iphone"
 
-REMOVE_COUNT   = 7      # сколько предметов убирать (если подходящих меньше — уберёт сколько есть)
+REMOVE_COUNT   = 7      # МАКСИМУМ предметов на видео (подходящих меньше — уберёт сколько есть, лишнего не тронет)
 OBJ_MIN_AREA   = 0.001  # размер предмета: от 0.1% кадра...
-OBJ_MAX_AREA   = 0.05   # ...до 5% кадра
-OBJ_MIN_CONTRAST = 6    # насколько предмет должен отличаться от окружения (меньше = больше кандидатов)
+OBJ_MAX_AREA   = 0.025  # ...до 2.5% кадра (крупнее — обычно куски мебели)
+OBJ_MIN_CONTRAST = 8    # насколько предмет должен отличаться от окружения (меньше = больше кандидатов)
+REPLACE_CHANCE = 0.5    # вероятность, что убранный предмет заменится новым похожим (0 = только удалять)
+REPLACE_MAX_AREA = 0.025 # заменять только небольшие предметы (до 2.5% кадра)
 FILL_METHOD    = "auto" # "auto" | "lama" (чётко, для неподвижной камеры) | "propainter" (для движущейся)
 RECOLOR_CLOTHES = True  # перекрашивать одежду в естественный цвет
 PROC_SHORT_SIDE = 432   # разрешение для ProPainter по короткой стороне (T4: 384–480)
@@ -75,6 +81,15 @@ for n in ["mattmdjaga/segformer_b2_clothes", "sayeed99/segformer_b3_clothes"]:
         print(f"{n} недоступна ({type(e).__name__})")
 PERSON_LABELS = {int(k): v.lower() for k, v in person_model.config.id2label.items()} if person_model else {}
 try:
+    ade_model = AutoModelForSemanticSegmentation.from_pretrained(
+        "nvidia/segformer-b2-finetuned-ade-512-512").to(DEV).half().eval()
+    ADE_LABELS = {int(k): v.lower().split(";")[0].split(",")[0].strip()
+                  for k, v in ade_model.config.id2label.items()}
+    print("Что за предмет: ADE20K")
+except Exception as e:
+    ade_model, ADE_LABELS = None, {}
+    print(f"ADE20K недоступна ({type(e).__name__}) — без проверки «мебель/стены»")
+try:
     sam = hf_pipeline("mask-generation", model="facebook/sam-vit-base", device=0)
     print("Поиск предметов: SAM")
 except Exception as e:
@@ -112,6 +127,46 @@ def person_probs(rgb):
     logits = person_model(pixel_values=x).logits.float()
     logits = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
     return logits.softmax(1)[0].permute(1, 2, 0).cpu().numpy()
+
+@torch.no_grad()
+def ade_classes(rgb):
+    """Карта классов ADE20K (номер класса на пиксель); считается в 1.5x для мелких предметов."""
+    h, w = rgb.shape[:2]
+    big = cv2.resize(rgb, (w * 3 // 2, h * 3 // 2), interpolation=cv2.INTER_CUBIC)
+    x = torch.from_numpy(big).to(DEV).permute(2, 0, 1)[None].float() / 255.0
+    logits = ade_model(pixel_values=((x - MEAN) / STD).half()).logits.float()
+    logits = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
+    return logits.argmax(1)[0].cpu().numpy()
+
+_sd = None
+def sd_inpaint(rgb, mask, prompt):
+    """Stable Diffusion Inpainting: рисует новый предмет внутри маски (rgb/mask 512x512)."""
+    global _sd
+    from PIL import Image
+    if _sd is None:
+        try:
+            import diffusers
+        except ImportError:
+            sh(f"{sys.executable} -m pip -q install diffusers accelerate")
+        from diffusers import StableDiffusionInpaintPipeline
+        _sd = False
+        for n in ["stable-diffusion-v1-5/stable-diffusion-inpainting", "Lykon/dreamshaper-8-inpainting",
+                  "runwayml/stable-diffusion-inpainting"]:
+            try:
+                _sd = StableDiffusionInpaintPipeline.from_pretrained(
+                    n, torch_dtype=torch.float16, safety_checker=None, requires_safety_checker=False).to(DEV)
+                _sd.set_progress_bar_config(disable=True)
+                print("Замена предметов:", n); break
+            except Exception as e:
+                print(f"{n} недоступна ({type(e).__name__})")
+    if _sd is False:
+        return None
+    img = _sd(prompt=prompt + ", realistic photo, same lighting and perspective, natural shadow, sharp",
+              negative_prompt="blurry, cartoon, illustration, text, watermark, logo, letters, deformed, "
+                              "duplicate, person, hands",
+              image=Image.fromarray(rgb), mask_image=Image.fromarray(mask), height=512, width=512,
+              num_inference_steps=30, guidance_scale=7.0).images[0]
+    return np.asarray(img.convert("RGB"))
 
 class Matter:
     """RobustVideoMatting: альфа человека (0..1) по кадрам, с памятью между кадрами."""
@@ -225,14 +280,55 @@ def blob_masks(rgb, bg):
     n, comp = cv2.connectedComponents(m)
     return [(comp == j).astype(np.uint8) for j in range(1, n)]
 
+# Что НИКОГДА не трогаем (куски мебели, стены, проёмы, улица, природа, транспорт)
+STRUCT_CLASSES = {
+    "wall", "building", "sky", "floor", "tree", "ceiling", "road", "bed", "windowpane", "window", "grass",
+    "cabinet", "sidewalk", "person", "earth", "door", "table", "mountain", "curtain", "chair", "car",
+    "water", "sofa", "shelf", "house", "sea", "mirror", "rug", "field", "armchair", "seat", "fence", "desk",
+    "rock", "wardrobe", "bathtub", "railing", "base", "column", "chest of drawers", "counter", "sand",
+    "sink", "skyscraper", "fireplace", "refrigerator", "grandstand", "path", "stairs", "runway",
+    "pool table", "screen door", "stairway", "river", "bridge", "bookcase", "blind", "coffee table",
+    "toilet", "hill", "bench", "countertop", "stove", "palm", "kitchen island", "swivel chair", "boat",
+    "bar", "hovel", "bus", "truck", "tower", "awning", "streetlight", "booth", "airplane", "dirt track",
+    "apparel", "pole", "land", "bannister", "escalator", "buffet", "stage", "van", "ship", "fountain",
+    "canopy", "washer", "swimming pool", "waterfall", "tent", "minibike", "oven", "step", "tank", "lake",
+    "dishwasher", "blanket", "hood", "pier", "shower", "radiator", "bicycle", "animal", "cradle"}
+# Что считаем отдельным предметом (в первую очередь)
+OBJECT_CLASSES = {
+    "box", "bottle", "vase", "lamp", "book", "plant", "flower", "pot", "basket", "bag", "plaything",
+    "clock", "ball", "tray", "plate", "glass", "cushion", "pillow", "towel", "sculpture", "fan",
+    "ashcan", "painting", "poster", "picture", "sconce", "light", "candlestick", "flowerpot", "food",
+    "computer", "monitor", "crt screen", "screen", "television receiver", "kitchen appliance",
+    "microwave", "bulletin board", "trade name", "signboard", "flag", "case", "barrel", "stool",
+    "ottoman", "toy", "jar", "bowl", "mug", "cup"}
+OUTDOOR_CLASSES = {"sky", "road", "sidewalk", "sea", "sand", "grass", "tree", "building", "mountain",
+                   "water", "field", "earth", "skyscraper", "land", "palm", "river", "lake", "hill"}
+
+def class_info(ade, m):
+    """Самый частый класс ADE под маской, доля «мебели/стен» и доля «предметов»."""
+    if ade is None:
+        return "?", 0.0, 0.0
+    ids, cnt = np.unique(ade[m > 0], return_counts=True)
+    names = [ADE_LABELS.get(int(k), "?") for k in ids]
+    tot = max(cnt.sum(), 1)
+    struct = sum(c for nm, c in zip(names, cnt) if nm in STRUCT_CLASSES) / tot
+    obj = sum(c for nm, c in zip(names, cnt) if nm in OBJECT_CLASSES) / tot
+    return names[int(np.argmax(cnt))], float(struct), float(obj)
+
 def find_objects(frame0, alpha0, sw, shh):
-    """frame0/alpha0 — опорный кадр (где фон виден лучше всего)."""
+    """frame0/alpha0 — опорный кадр (где фон виден лучше всего).
+    Возвращает отдельные небольшие компактные предметы (без дублей), сцену (outdoor) и уменьшенный кадр."""
     small = cv2.resize(frame0, (sw, shh), interpolation=cv2.INTER_AREA)
     lab_img = cv2.cvtColor(small.astype(np.float32) / 255, cv2.COLOR_RGB2Lab)
     a_s = cv2.resize(alpha0, (sw, shh))
     person = cv2.dilate((a_s > 0.2).astype(np.uint8), np.ones((15, 15), np.uint8))
-    stats = {"SAM масок": 0, "не тот размер": 0, "на человеке": 0, "полоска": 0,
-             "слабый контраст": 0, "подходят": 0}
+    ade = ade_classes(small) if ade_model is not None else None
+    outdoor = False
+    if ade is not None:
+        bg_names = [ADE_LABELS.get(int(k), "?") for k in ade[person == 0].ravel()[::7]]
+        outdoor = np.mean([nm in OUTDOOR_CLASSES for nm in bg_names]) > 0.3 if bg_names else False
+    stats = {"SAM масок": 0, "не тот размер": 0, "на человеке": 0, "у края кадра": 0,
+             "не компактный": 0, "мебель/стены": 0, "слабый контраст": 0, "подходят": 0}
     found = []
     for src, masks in (("SAM", sam_masks(small)), ("пятна", blob_masks(small, person == 0))):
         if src == "SAM":
@@ -244,27 +340,35 @@ def find_objects(frame0, alpha0, sw, shh):
             if (m & person).sum() > 0.5 * m.sum():           # частично за волосами/рукой — можно
                 stats["на человеке"] += 1; continue
             x, y, bw, bh = cv2.boundingRect(m)
-            if src != "SAM" and (x == 0 or y == 0 or x + bw >= sw or y + bh >= shh):
-                stats["полоска"] += 1; continue                  # «пятно» у края кадра — обычно край мебели
-            if m.sum() < 0.3 * bw * bh or min(bw, bh) < 0.15 * max(bw, bh):   # тонкая полоска/контур
-                stats["полоска"] += 1; continue
+            if x <= 2 or y <= 2 or x + bw >= sw - 2 or y + bh >= shh - 2:
+                stats["у края кадра"] += 1; continue            # обрезанный край мебели/двери
+            cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            hull = cv2.contourArea(cv2.convexHull(np.vstack(cnts))) if cnts else 0
+            solidity = m.sum() / max(hull, 1)
+            if m.sum() < 0.4 * bw * bh or min(bw, bh) < 0.25 * max(bw, bh) or solidity < 0.8:
+                stats["не компактный"] += 1; continue           # полоски, контуры, рваные куски
+            cls, struct, obj = class_info(ade, m)
+            if (struct > 0.6 and obj < 0.2) or (src != "SAM" and obj < 0.3 and ade is not None):
+                stats["мебель/стены"] += 1; continue
             c = contrast(lab_img, m)
-            if c < OBJ_MIN_CONTRAST:
+            if c < (0.75 * OBJ_MIN_CONTRAST if obj >= 0.3 else 1.5 * OBJ_MIN_CONTRAST):   # опознанным мягче, остальным строже
                 stats["слабый контраст"] += 1; continue
             stats["подходят"] += 1
-            found.append((c, area, m, src))
-    # Убираем дубли: из вложенных масок берём ВНЕШНЮЮ (вся коробка, а не рисунок на ней);
-    # сначала предметы от SAM, потом «пятна»
-    found.sort(key=lambda x: (x[3] != "SAM", -x[1]))
+            found.append(dict(c=c, area=area, m=m, src=src, cls=cls, obj=obj))
+    # Убираем дубли: из вложенных масок берём ВНЕШНЮЮ (вся коробка, а не рисунок на ней)
+    found.sort(key=lambda d: -d["area"])
     taken, cands = np.zeros((shh, sw), np.uint8), []
-    for c, area, m, src in found:
-        if (m & taken).sum() > 0.3 * m.sum():
+    for d in found:
+        if (d["m"] & taken).sum() > 0.3 * d["m"].sum():
             continue
-        taken |= m
-        cands.append((c, area, m, src))
+        taken |= d["m"]
+        cands.append(d)
     print("Поиск предметов:", ", ".join(f"{k}: {v}" for k, v in stats.items()),
-          f"| без дублей: {len(cands)}")
-    return cands, small
+          f"| без дублей: {len(cands)}" + (" | сцена: улица" if outdoor else ""))
+    for d in cands:
+        print(f"   {d['cls']:<16} {100 * d['area']:.2f}% кадра, контраст {d['c']:.0f}, "
+              f"{'предмет' if d['obj'] >= 0.3 else 'не опознан'} ({d['src']})")
+    return cands, small, outdoor
 
 def is_static(obj_full, frames, alphas_dir, A_list, idxs, W, H, ref):
     """Предмет не двигается сам (люди, машины, волны): сравнение с опорным кадром после
@@ -292,14 +396,31 @@ def is_static(obj_full, frames, alphas_dir, A_list, idxs, W, H, ref):
             fails += 1
     return not (checked and fails >= max(2, (checked + 1) // 2))   # «двигается» на половине кадров и больше
 
-def save_debug(small, cands, removed_idx, path, note):
+def save_debug(small, cands, removed_idx, replaced_idx, path, note):
     img = small.copy()
-    for i, (c, area, m, src) in enumerate(cands):
-        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(img, cnts, -1, (255, 0, 0) if i in removed_idx else (255, 220, 0),
-                         3 if i in removed_idx else 1)
+    for i, d in enumerate(cands):
+        cnts, _ = cv2.findContours(d["m"], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        col = (0, 255, 0) if i in replaced_idx else (255, 0, 0) if i in removed_idx else (255, 220, 0)
+        cv2.drawContours(img, cnts, -1, col, 3 if i in removed_idx else 1)
     cv2.putText(img, note, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+# Чем заменять (похожие предметы того же типа)
+SIMILAR = {
+    "box": ["a cardboard box", "a small wooden box", "a white storage box", "a shoe box"],
+    "bottle": ["a glass bottle", "a plastic water bottle", "a wine bottle"],
+    "vase": ["a ceramic vase", "a glass vase"], "flower": ["a vase with flowers"],
+    "book": ["a stack of books", "a closed hardcover book"],
+    "plant": ["a small potted plant", "a succulent in a pot"], "pot": ["a small potted plant"],
+    "flowerpot": ["a small potted plant"], "lamp": ["a small table lamp"],
+    "basket": ["a woven basket"], "bag": ["a handbag", "a paper shopping bag"],
+    "painting": ["a framed picture"], "poster": ["a framed poster"], "picture": ["a framed picture"],
+    "clock": ["a round clock"], "cushion": ["a decorative pillow"], "pillow": ["a decorative pillow"],
+    "plaything": ["a plush toy"], "toy": ["a plush toy"], "towel": ["a folded towel"],
+    "glass": ["a drinking glass"], "cup": ["a ceramic mug"], "mug": ["a ceramic mug"],
+}
+DEFAULT_SIMILAR = ["a cardboard box", "a small potted plant", "a stack of books", "a ceramic vase",
+                   "a decorative candle", "a woven basket"]
 
 # 4) Перекраска одежды (естественный цвет: оттенок + светлота «ткани»)
 def clothes_recolor(rgb, w, target_rgb, gain):
@@ -394,27 +515,27 @@ def process_video(src, dst, log_rows):
     print(f"Опорный кадр: {ref} (человек занимает {100 * min(areas):.0f}% кадра)")
     frame_r = cv2.cvtColor(cv2.imread(frames[ref]), cv2.COLOR_BGR2RGB)
     alpha_r = cv2.imread(f"{tmp}/alpha/{ref:06d}.png", cv2.IMREAD_GRAYSCALE) / 255.0
-    cands, small0 = find_objects(frame_r, alpha_r, sw, shh)
-    # Сначала настоящие предметы от SAM (самые заметные, в случайном порядке), потом «пятна»
-    sam_i = [i for i, c in enumerate(cands) if c[3] == "SAM"][:4 * REMOVE_COUNT]
-    blob_i = [i for i, c in enumerate(cands) if c[3] != "SAM"][:4 * REMOVE_COUNT]
-    random.shuffle(sam_i); random.shuffle(blob_i)
-    order = sam_i + blob_i
+    cands, small0, outdoor = find_objects(frame_r, alpha_r, sw, shh)
+    # Сначала опознанные предметы (коробки, бутылки, вазы, книги...) в случайном порядке,
+    # потом неопознанные, но явно отделённые от фона (самые контрастные первыми)
+    good = [i for i, d in enumerate(cands) if d["obj"] >= 0.3]
+    other = sorted((i for i, d in enumerate(cands) if d["obj"] < 0.3), key=lambda i: -cands[i]["c"])
+    random.shuffle(good)
+    order = good + other
     idxs = sorted(set(np.linspace(0, n - 1, 9).astype(int).tolist()) - {ref})
     removed, moving = [], 0
     for i in order:
         if len(removed) >= REMOVE_COUNT:
             break
-        obj_full = cv2.resize(cands[i][2], (W, H), interpolation=cv2.INTER_NEAREST)
+        obj_full = cv2.resize(cands[i]["m"], (W, H), interpolation=cv2.INTER_NEAREST)
         if is_static(obj_full, frames, f"{tmp}/alpha", A_list, idxs, W, H, ref):
             removed.append(i)
         else:
             moving += 1
-    note = f"найдено {len(cands)}, убрано {len(removed)}" + (f", двигаются {moving}" if moving else "")
-    print("Предметы:", note)
+    if len(removed) < REMOVE_COUNT:
+        print(f"Подходящих неподвижных предметов: {len(removed)} (лимит {REMOVE_COUNT}) — "
+              f"больше ничего не трогаю, чтобы не портить мебель и стены")
     name0 = os.path.splitext(os.path.basename(dst))[0]
-    save_debug(small0, cands, set(removed), f"{OUTPUT_DIR}/{name0}_debug.jpg",
-               f"found {len(cands)}, removed {len(removed)}, moving {moving}")   # OpenCV не пишет кириллицу
 
     shift = max(np.abs((A @ np.linalg.inv(A_list[ref]))[:2, 2]).max() for A in A_list) / min(W, H)
     method = FILL_METHOD if FILL_METHOD != "auto" else ("lama" if shift < 0.03 else "propainter")
@@ -423,12 +544,24 @@ def process_video(src, dst, log_rows):
     if removed:
         print(f"Сдвиг камеры: {100 * shift:.1f}% кадра -> дорисовка: {method}")
 
+    # Какие из убранных заменить новым похожим (только мелкие, неподвижная камера, помещение)
+    replace = {}
+    if REPLACE_CHANCE > 0 and removed:
+        if method != "lama":
+            print("Замена предметов пропущена: камера двигается (только удаление)")
+        elif outdoor:
+            print("Замена предметов пропущена: сцена на улице (только удаление)")
+        else:
+            for i in removed:
+                if cands[i]["area"] <= REPLACE_MAX_AREA and random.random() < REPLACE_CHANCE:
+                    replace[i] = random.choice(SIMILAR.get(cands[i]["cls"], DEFAULT_SIMILAR))
+
     # LaMa: чистый опорный кадр (предметы + человек рядом с ними дорисованы), один раз
     plate = obj_ref = None
     if removed and method == "lama":
         obj_ref = np.zeros((H, W), np.uint8)
         for i in removed:
-            obj_ref |= cv2.resize(cands[i][2], (W, H), interpolation=cv2.INTER_NEAREST)
+            obj_ref |= cv2.resize(cands[i]["m"], (W, H), interpolation=cv2.INTER_NEAREST)
         obj_ref = cv2.dilate(obj_ref, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
         near = cv2.dilate(obj_ref, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))
         hole = obj_ref | ((alpha_r > 0.1) & (near > 0)).astype(np.uint8)   # и волосы поверх предмета
@@ -454,14 +587,36 @@ def process_video(src, dst, log_rows):
             if k < 1:
                 res = cv2.resize(res, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_CUBIC)
             plate[Y0:Y1, X0:X1] = np.where(mc[..., None] > 0, res, crop)
+        # Новый похожий предмет на месте части убранных (рисуется на уже очищенном кадре)
+        for i, prompt in list(replace.items()):
+            mi = cv2.resize(cands[i]["m"], (W, H), interpolation=cv2.INTER_NEAREST)
+            mi = cv2.dilate(mi, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+            ys, xs = np.nonzero(mi)
+            side = int(min(max(256, 2.4 * max(xs.max() - xs.min(), ys.max() - ys.min())), min(W, H)))
+            cx, cy = (xs.min() + xs.max()) // 2, (ys.min() + ys.max()) // 2
+            X0 = int(np.clip(cx - side // 2, 0, W - side)); Y0 = int(np.clip(cy - side // 2, 0, H - side))
+            crop, mc = plate[Y0:Y0 + side, X0:X0 + side], mi[Y0:Y0 + side, X0:X0 + side]
+            res = sd_inpaint(cv2.resize(crop, (512, 512), interpolation=cv2.INTER_AREA),
+                             cv2.resize(mc * 255, (512, 512), interpolation=cv2.INTER_NEAREST), prompt)
+            if res is None:                                  # SD недоступна — остаётся просто удаление
+                replace.clear(); break
+            res = cv2.resize(res, (side, side), interpolation=cv2.INTER_CUBIC).astype(np.float32)
+            fm = cv2.GaussianBlur(mc.astype(np.float32), (0, 0), 2)[..., None]
+            plate[Y0:Y0 + side, X0:X0 + side] = np.clip(fm * res + (1 - fm) * crop, 0, 255).astype(np.uint8)
+            print(f"Заменено: {cands[i]['cls']} -> {prompt}")
         cv2.imwrite(f"{OUTPUT_DIR}/{name0}_cleaned_frame.jpg", cv2.cvtColor(plate, cv2.COLOR_RGB2BGR),
                     [cv2.IMWRITE_JPEG_QUALITY, 92])
         obj_ref = cv2.GaussianBlur(obj_ref.astype(np.float32), (0, 0), 3)
 
+    note = f"found {len(cands)}, removed {len(removed) - len(replace)}, replaced {len(replace)}" + \
+           (f", moving {moving}" if moving else "")
+    print("Предметы:", note)
+    save_debug(small0, cands, set(removed), set(replace), f"{OUTPUT_DIR}/{name0}_debug.jpg", note)
+
     # Маска удаления в кадре 0 (полное разрешение), с запасом под тень/кант
     obj0 = np.zeros((H, W), np.uint8)
     for i in removed:
-        obj0 |= cv2.resize(cands[i][2], (W, H), interpolation=cv2.INTER_NEAREST)
+        obj0 |= cv2.resize(cands[i]["m"], (W, H), interpolation=cv2.INTER_NEAREST)
     if removed:
         obj0 = cv2.dilate(obj0, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)))
         # маска найдена на опорном кадре — переводим её в координаты кадра 0
@@ -565,8 +720,13 @@ def process_video(src, dst, log_rows):
 
     name = os.path.basename(dst)
     for i in removed:
-        c, area, m, src_ = cands[i]
-        log_rows.append([name, "убрано", f"предмет ({src_}, {method})", f"{100 * area:.2f}%"])
+        d = cands[i]
+        if i in replace:
+            log_rows.append([name, "заменено", f"{d['cls']} -> {replace[i]}", f"{100 * d['area']:.2f}%"])
+        else:
+            log_rows.append([name, "убрано", f"{d['cls']} ({d['src']}, {method})", f"{100 * d['area']:.2f}%"])
+    if not removed:
+        log_rows.append([name, "предметы", "подходящих не найдено — фон не трогали", ""])
     if use_clothes:
         log_rows.append([name, "одежда", c_hex, ""])
     print(f"Время: {(time.time() - t0) / 60:.1f} мин")
