@@ -16,7 +16,8 @@
 #    5) Всё, что не правилось, — пиксели оригинала в полном разрешении
 #  Результат называется как исходник: IMG_0038.MOV -> output_iphone/IMG_0038.mp4
 #  Отчёт: output_iphone/IMG_0038_debug.jpg (жёлтым — подходящие предметы, красным — убранные,
-#         зелёным — заменённые), output_iphone/IMG_0038_cleaned_frame.jpg — опорный кадр после правки
+#         зелёным — заменённые), output_iphone/IMG_0038_cleaned_frame.jpg — опорный кадр после правки,
+#         output_iphone/IMG_0038_candidates.jpg — все куски SAM подходящего размера и почему отсеяны
 # ==============================================================================
 
 # ----------------------------- НАСТРОЙКИ --------------------------------------
@@ -129,10 +130,12 @@ def person_probs(rgb):
     return logits.softmax(1)[0].permute(1, 2, 0).cpu().numpy()
 
 @torch.no_grad()
-def ade_classes(rgb):
-    """Карта классов ADE20K (номер класса на пиксель); считается в 1.5x для мелких предметов."""
+def ade_classes(rgb, short=768):
+    """Карта классов ADE20K (номер класса на пиксель); картинка увеличивается до short по короткой стороне."""
     h, w = rgb.shape[:2]
-    big = cv2.resize(rgb, (w * 3 // 2, h * 3 // 2), interpolation=cv2.INTER_CUBIC)
+    k = short / min(h, w)
+    big = cv2.resize(rgb, (max(32, round(w * k / 32) * 32), max(32, round(h * k / 32) * 32)),
+                     interpolation=cv2.INTER_CUBIC)
     x = torch.from_numpy(big).to(DEV).permute(2, 0, 1)[None].float() / 255.0
     logits = ade_model(pixel_values=((x - MEAN) / STD).half()).logits.float()
     logits = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
@@ -260,12 +263,21 @@ class BgTracker:
         return self.A
 
 # 3) Поиск предметов на кадре 0
-def contrast(lab_img, obj):
-    """Насколько предмет отличается по цвету от полоски вокруг (ΔE в Lab)."""
+def contrast(lab_img, obj, person=None):
+    """Насколько предмет отделён от окружения: разница среднего цвета (ΔE в Lab) или резкость
+    его границы (бело-чёрная коробка на серой стене по среднему цвету почти не отличается,
+    но край у неё чёткий). Человек не учитывается."""
     ring = cv2.dilate(obj, np.ones((15, 15), np.uint8)) - obj
+    edge = obj - cv2.erode(obj, np.ones((3, 3), np.uint8)) | cv2.dilate(obj, np.ones((3, 3), np.uint8)) - obj
+    if person is not None:
+        obj, ring, edge = obj & (person == 0), ring & (person == 0), edge & (person == 0)
     if ring.sum() < 20 or obj.sum() < 20:
         return 0.0
-    return float(np.linalg.norm(lab_img[obj > 0].mean(0) - lab_img[ring > 0].mean(0)))
+    de = float(np.linalg.norm(lab_img[obj > 0].mean(0) - lab_img[ring > 0].mean(0)))
+    L = cv2.GaussianBlur(lab_img[..., 0], (0, 0), 1)
+    grad = np.hypot(cv2.Sobel(L, cv2.CV_32F, 1, 0), cv2.Sobel(L, cv2.CV_32F, 0, 1)) / 4
+    sharp = float(np.median(grad[edge > 0])) if edge.sum() > 20 else 0.0
+    return max(de, sharp)
 
 def blob_masks(rgb, bg):
     """Запасной поиск без нейросети: области фона, заметно отличающиеся от своего окружения
@@ -304,32 +316,47 @@ OBJECT_CLASSES = {
 OUTDOOR_CLASSES = {"sky", "road", "sidewalk", "sea", "sand", "grass", "tree", "building", "mountain",
                    "water", "field", "earth", "skyscraper", "land", "palm", "river", "lake", "hill"}
 
-def class_info(ade, m):
-    """Самый частый класс ADE под маской, доля «мебели/стен» и доля «предметов»."""
-    if ade is None:
+# Короткие коды причин для картинки-диагностики (OpenCV не пишет кириллицу) и их цвета
+REASONS = {"на человеке": ("P", (255, 0, 255)), "у края кадра": ("E", (0, 160, 255)),
+           "не компактный": ("C", (255, 140, 0)), "мебель/стены": ("F", (255, 0, 0)),
+           "слабый контраст": ("L", (160, 160, 160)), "подходят": ("OK", (0, 255, 0))}
+
+def class_info(small, m, person):
+    """Что под маской по ADE20K. Считается на УВЕЛИЧЕННОМ куске вокруг предмета — так мелкие вещи
+    распознаются как вещи, а не как «шкаф/стена» вокруг них. Возвращает класс, долю «мебели/стен»,
+    долю «предметов»."""
+    if ade_model is None:
         return "?", 0.0, 0.0
-    ids, cnt = np.unique(ade[m > 0], return_counts=True)
+    h, w = m.shape
+    x, y, bw, bh = cv2.boundingRect(m)
+    pad = max(16, max(bw, bh) // 2)
+    X0, Y0, X1, Y1 = max(0, x - pad), max(0, y - pad), min(w, x + bw + pad), min(h, y + bh + pad)
+    ade = ade_classes(small[Y0:Y1, X0:X1], short=384)
+    sel = (m[Y0:Y1, X0:X1] > 0) & (person[Y0:Y1, X0:X1] == 0)
+    if sel.sum() < 10:
+        sel = m[Y0:Y1, X0:X1] > 0
+    ids, cnt = np.unique(ade[sel], return_counts=True)
     names = [ADE_LABELS.get(int(k), "?") for k in ids]
     tot = max(cnt.sum(), 1)
     struct = sum(c for nm, c in zip(names, cnt) if nm in STRUCT_CLASSES) / tot
     obj = sum(c for nm, c in zip(names, cnt) if nm in OBJECT_CLASSES) / tot
     return names[int(np.argmax(cnt))], float(struct), float(obj)
 
-def find_objects(frame0, alpha0, sw, shh):
+def find_objects(frame0, alpha0, sw, shh, diag_path=None):
     """frame0/alpha0 — опорный кадр (где фон виден лучше всего).
     Возвращает отдельные небольшие компактные предметы (без дублей), сцену (outdoor) и уменьшенный кадр."""
     small = cv2.resize(frame0, (sw, shh), interpolation=cv2.INTER_AREA)
     lab_img = cv2.cvtColor(small.astype(np.float32) / 255, cv2.COLOR_RGB2Lab)
     a_s = cv2.resize(alpha0, (sw, shh))
     person = cv2.dilate((a_s > 0.2).astype(np.uint8), np.ones((15, 15), np.uint8))
-    ade = ade_classes(small) if ade_model is not None else None
     outdoor = False
-    if ade is not None:
+    if ade_model is not None:
+        ade = ade_classes(small, short=512)
         bg_names = [ADE_LABELS.get(int(k), "?") for k in ade[person == 0].ravel()[::7]]
         outdoor = np.mean([nm in OUTDOOR_CLASSES for nm in bg_names]) > 0.3 if bg_names else False
     stats = {"SAM масок": 0, "не тот размер": 0, "на человеке": 0, "у края кадра": 0,
              "не компактный": 0, "мебель/стены": 0, "слабый контраст": 0, "подходят": 0}
-    found = []
+    found, diag = [], []
     for src, masks in (("SAM", sam_masks(small)), ("пятна", blob_masks(small, person == 0))):
         if src == "SAM":
             stats["SAM масок"] = len(masks)
@@ -337,24 +364,33 @@ def find_objects(frame0, alpha0, sw, shh):
             area = m.sum() / (sw * shh)
             if not (OBJ_MIN_AREA <= area <= OBJ_MAX_AREA):
                 stats["не тот размер"] += 1; continue
-            if (m & person).sum() > 0.5 * m.sum():           # частично за волосами/рукой — можно
-                stats["на человеке"] += 1; continue
+            reason, cls, c, obj = None, "", 0.0, 0.0
+            vis = m & (person == 0)                          # видимая часть (без волос/руки поверх)
             x, y, bw, bh = cv2.boundingRect(m)
-            if x <= 2 or y <= 2 or x + bw >= sw - 2 or y + bh >= shh - 2:
-                stats["у края кадра"] += 1; continue            # обрезанный край мебели/двери
-            cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            hull = cv2.contourArea(cv2.convexHull(np.vstack(cnts))) if cnts else 0
-            solidity = m.sum() / max(hull, 1)
-            if m.sum() < 0.4 * bw * bh or min(bw, bh) < 0.25 * max(bw, bh) or solidity < 0.8:
-                stats["не компактный"] += 1; continue           # полоски, контуры, рваные куски
-            cls, struct, obj = class_info(ade, m)
-            if (struct > 0.6 and obj < 0.2) or (src != "SAM" and obj < 0.3 and ade is not None):
-                stats["мебель/стены"] += 1; continue
-            c = contrast(lab_img, m)
-            if c < (0.75 * OBJ_MIN_CONTRAST if obj >= 0.3 else 1.5 * OBJ_MIN_CONTRAST):   # опознанным мягче, остальным строже
-                stats["слабый контраст"] += 1; continue
-            stats["подходят"] += 1
-            found.append(dict(c=c, area=area, m=m, src=src, cls=cls, obj=obj))
+            if vis.sum() < 0.5 * m.sum():
+                reason = "на человеке"
+            elif x <= 2 or y <= 2 or x + bw >= sw - 2 or y + bh >= shh - 2:
+                reason = "у края кадра"                       # обрезанный край мебели/двери
+            else:
+                cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                hull = cv2.contourArea(cv2.convexHull(np.vstack(cnts))) if cnts else 0
+                solidity = m.sum() / max(hull, 1)
+                if m.sum() < 0.35 * bw * bh or min(bw, bh) < 0.2 * max(bw, bh) or solidity < 0.7:
+                    reason = "не компактный"                  # полоски, контуры, рваные куски
+            if reason is None:
+                cls, struct, obj = class_info(small, m, person)
+                if (struct > 0.6 and obj < 0.15) or (src != "SAM" and obj < 0.3 and ade_model is not None):
+                    reason = "мебель/стены"
+            if reason is None:
+                c = contrast(lab_img, m, person)
+                if c < (0.5 * OBJ_MIN_CONTRAST if obj >= 0.3 else 1.5 * OBJ_MIN_CONTRAST):   # опознанным мягче
+                    reason = "слабый контраст"
+            reason = reason or "подходят"
+            stats[reason] += 1
+            if src == "SAM":
+                diag.append((m, reason, cls, area))
+            if reason == "подходят":
+                found.append(dict(c=c, area=area, m=m, src=src, cls=cls, obj=obj))
     # Убираем дубли: из вложенных масок берём ВНЕШНЮЮ (вся коробка, а не рисунок на ней)
     found.sort(key=lambda d: -d["area"])
     taken, cands = np.zeros((shh, sw), np.uint8), []
@@ -368,6 +404,18 @@ def find_objects(frame0, alpha0, sw, shh):
     for d in cands:
         print(f"   {d['cls']:<16} {100 * d['area']:.2f}% кадра, контраст {d['c']:.0f}, "
               f"{'предмет' if d['obj'] >= 0.3 else 'не опознан'} ({d['src']})")
+    if diag_path:                                            # все куски SAM подходящего размера + причина
+        img = (small * 0.6).astype(np.uint8)
+        for m, reason, cls, area in sorted(diag, key=lambda t: -t[3]):
+            code, col = REASONS[reason]
+            cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(img, cnts, -1, col, 2 if reason == "подходят" else 1)
+            x, y, bw, bh = cv2.boundingRect(m)
+            cv2.putText(img, code + (f" {cls}" if cls else ""), (x + 2, y + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, col, 1, cv2.LINE_AA)
+        legend = "P=person E=edge C=not compact F=furniture/wall L=low contrast OK=fits"
+        cv2.putText(img, legend, (6, shh - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.imwrite(diag_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])
     return cands, small, outdoor
 
 def is_static(obj_full, frames, alphas_dir, A_list, idxs, W, H, ref):
@@ -515,7 +563,8 @@ def process_video(src, dst, log_rows):
     print(f"Опорный кадр: {ref} (человек занимает {100 * min(areas):.0f}% кадра)")
     frame_r = cv2.cvtColor(cv2.imread(frames[ref]), cv2.COLOR_BGR2RGB)
     alpha_r = cv2.imread(f"{tmp}/alpha/{ref:06d}.png", cv2.IMREAD_GRAYSCALE) / 255.0
-    cands, small0, outdoor = find_objects(frame_r, alpha_r, sw, shh)
+    name0 = os.path.splitext(os.path.basename(dst))[0]
+    cands, small0, outdoor = find_objects(frame_r, alpha_r, sw, shh, f"{OUTPUT_DIR}/{name0}_candidates.jpg")
     # Сначала опознанные предметы (коробки, бутылки, вазы, книги...) в случайном порядке,
     # потом неопознанные, но явно отделённые от фона (самые контрастные первыми)
     good = [i for i, d in enumerate(cands) if d["obj"] >= 0.3]
@@ -535,7 +584,6 @@ def process_video(src, dst, log_rows):
     if len(removed) < REMOVE_COUNT:
         print(f"Подходящих неподвижных предметов: {len(removed)} (лимит {REMOVE_COUNT}) — "
               f"больше ничего не трогаю, чтобы не портить мебель и стены")
-    name0 = os.path.splitext(os.path.basename(dst))[0]
 
     shift = max(np.abs((A @ np.linalg.inv(A_list[ref]))[:2, 2]).max() for A in A_list) / min(W, H)
     method = FILL_METHOD if FILL_METHOD != "auto" else ("lama" if shift < 0.03 else "propainter")
