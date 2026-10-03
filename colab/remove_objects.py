@@ -246,23 +246,26 @@ def is_static(obj_full, frames, alphas_dir, A_list, idxs, W, H, ref):
     компенсации движения камеры и автоэкспозиции."""
     f0 = cv2.cvtColor(cv2.imread(frames[ref]), cv2.COLOR_BGR2RGB).astype(np.float32)
     ring = cv2.dilate(obj_full, np.ones((31, 31), np.uint8)) - obj_full
+    checked = fails = 0
     for t in idxs:
         M = (A_list[t] @ np.linalg.inv(A_list[ref]))[:2]          # опорный кадр -> кадр t
         ft = cv2.cvtColor(cv2.imread(frames[t]), cv2.COLOR_BGR2RGB)
         back = cv2.warpAffine(ft, M, (W, H), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                               borderMode=cv2.BORDER_REFLECT).astype(np.float32)
         at = cv2.imread(f"{alphas_dir}/{t:06d}.png", cv2.IMREAD_GRAYSCALE)
-        at = cv2.warpAffine(at, M, (W, H), flags=cv2.WARP_INVERSE_MAP) < 50
+        at = cv2.warpAffine(at, M, (W, H), flags=cv2.WARP_INVERSE_MAP)
+        at = cv2.dilate((at > 25).astype(np.uint8), np.ones((31, 31), np.uint8)) == 0   # с запасом от волос/рук
         o, r = (obj_full > 0) & at, (ring > 0) & at
-        if o.sum() < 50:
+        if o.sum() < 0.5 * (obj_full > 0).sum():           # предмет в этом кадре в основном закрыт
             continue
         if r.sum() > 50:
             back = back * (f0[r].mean(0) / np.maximum(back[r].mean(0), 1))
         d = np.abs(back - f0).mean(-1)
         d_obj, d_ring = d[o].mean(), d[r].mean() if r.sum() > 50 else 0
+        checked += 1
         if d_obj > 20 and d_obj > 2.5 * d_ring + 5:
-            return False
-    return True
+            fails += 1
+    return not (checked and fails >= max(2, (checked + 1) // 2))   # «двигается» на половине кадров и больше
 
 def save_debug(small, cands, removed_idx, path, note):
     img = small.copy()
@@ -362,9 +365,12 @@ def process_video(src, dst, log_rows):
     frame_r = cv2.cvtColor(cv2.imread(frames[ref]), cv2.COLOR_BGR2RGB)
     alpha_r = cv2.imread(f"{tmp}/alpha/{ref:06d}.png", cv2.IMREAD_GRAYSCALE) / 255.0
     cands, small0 = find_objects(frame_r, alpha_r, sw, shh)
-    order = list(range(min(len(cands), 4 * REMOVE_COUNT)))      # из самых заметных — случайные
-    random.shuffle(order)
-    idxs = sorted({0, n // 3, 2 * n // 3, n - 1} - {ref})
+    # Сначала настоящие предметы от SAM (самые заметные, в случайном порядке), потом «пятна»
+    sam_i = [i for i, c in enumerate(cands) if c[3] == "SAM"][:4 * REMOVE_COUNT]
+    blob_i = [i for i, c in enumerate(cands) if c[3] != "SAM"][:4 * REMOVE_COUNT]
+    random.shuffle(sam_i); random.shuffle(blob_i)
+    order = sam_i + blob_i
+    idxs = sorted(set(np.linspace(0, n - 1, 9).astype(int).tolist()) - {ref})
     removed, moving = [], 0
     for i in order:
         if len(removed) >= REMOVE_COUNT:
@@ -377,7 +383,8 @@ def process_video(src, dst, log_rows):
     note = f"найдено {len(cands)}, убрано {len(removed)}" + (f", двигаются {moving}" if moving else "")
     print("Предметы:", note)
     name0 = os.path.splitext(os.path.basename(dst))[0]
-    save_debug(small0, cands, set(removed), f"{OUTPUT_DIR}/{name0}_debug.jpg", note)
+    save_debug(small0, cands, set(removed), f"{OUTPUT_DIR}/{name0}_debug.jpg",
+               f"found {len(cands)}, removed {len(removed)}, moving {moving}")   # OpenCV не пишет кириллицу
 
     # Маска удаления в кадре 0 (полное разрешение), с запасом под тень/кант
     obj0 = np.zeros((H, W), np.uint8)
