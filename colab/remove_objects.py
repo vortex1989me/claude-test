@@ -241,9 +241,11 @@ def find_objects(frame0, alpha0, sw, shh):
             area = m.sum() / (sw * shh)
             if not (OBJ_MIN_AREA <= area <= OBJ_MAX_AREA):
                 stats["не тот размер"] += 1; continue
-            if (m & person).sum() > 0.3 * m.sum():           # частично за волосами/рукой — можно
+            if (m & person).sum() > 0.5 * m.sum():           # частично за волосами/рукой — можно
                 stats["на человеке"] += 1; continue
             x, y, bw, bh = cv2.boundingRect(m)
+            if src != "SAM" and (x == 0 or y == 0 or x + bw >= sw or y + bh >= shh):
+                stats["полоска"] += 1; continue                  # «пятно» у края кадра — обычно край мебели
             if m.sum() < 0.3 * bw * bh or min(bw, bh) < 0.15 * max(bw, bh):   # тонкая полоска/контур
                 stats["полоска"] += 1; continue
             c = contrast(lab_img, m)
@@ -342,7 +344,7 @@ def clothes_weight(rgb_small, alpha_small):
     solid = cv2.morphologyEx((cl > 0.35).astype(np.uint8), cv2.MORPH_CLOSE,
                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))).astype(np.float32)
     w = np.maximum(cl, solid * 0.95) * (keep < 0.5) * np.clip(alpha_small * 1.5, 0, 1)
-    return np.clip(cv2.GaussianBlur(w, (0, 0), 1.2), 0, 1)
+    return np.clip(cv2.GaussianBlur(w.astype(np.float32), (0, 0), 1.2), 0, 1)
 
 # 5) Видео целиком
 def process_video(src, dst, log_rows):
@@ -540,7 +542,7 @@ def process_video(src, dst, log_rows):
                 out = np.clip(m[..., None] * fill + (1 - m[..., None]) * orig, 0, 255).astype(np.uint8)
         if use_clothes:
             small = cv2.resize(orig, (sw, shh), interpolation=cv2.INTER_AREA)
-            a_small = cv2.resize(cv2.imread(f"{tmp}/alpha/{i:06d}.png", cv2.IMREAD_GRAYSCALE), (sw, shh)) / 255.0
+            a_small = cv2.resize(cv2.imread(f"{tmp}/alpha/{i:06d}.png", cv2.IMREAD_GRAYSCALE), (sw, shh)).astype(np.float32) / 255
             w = clothes_weight(small, a_small)
             if prev_w is not None:
                 w = 0.4 * w + 0.6 * prev_w                # меньше дрожания краёв
