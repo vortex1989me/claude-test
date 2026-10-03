@@ -106,7 +106,8 @@ def object_masks(rgb):
         return []
     from PIL import Image
     out = sam(Image.fromarray(rgb), points_per_batch=64)
-    return [np.asarray(m).astype(np.uint8) for m in out["masks"]]
+    masks = [m.cpu().numpy() if hasattr(m, "cpu") else np.asarray(m) for m in out["masks"]]
+    return [np.squeeze(m).astype(np.uint8) for m in masks]
 
 # LaMa — нейросеть для удаления предметов (дорисовывает фон продолжением текстуры)
 LAMA_URL = "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"
