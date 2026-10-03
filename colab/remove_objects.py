@@ -431,13 +431,19 @@ def process_video(src, dst, log_rows):
         near = cv2.dilate(obj_ref, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))
         hole = obj_ref | ((alpha_r > 0.1) & (near > 0)).astype(np.uint8)   # и волосы поверх предмета
         plate = frame_r.copy()
+        hole = cv2.morphologyEx(hole, cv2.MORPH_CLOSE,                    # обрывки -> цельные области
+                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
         n_c, comp = cv2.connectedComponents(hole)
         for j in range(1, n_c):
             mj = (comp == j).astype(np.uint8)
+            if mj.sum() < 50:
+                continue
             ys, xs = np.nonzero(mj)
             x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
-            bw, bh = x1 - x0 + 1, y1 - y0 + 1
-            X0, X1, Y0, Y1 = max(0, x0 - bw), min(W, x1 + bw + 1), max(0, y0 - bh), min(H, y1 + bh + 1)
+            bw, bh = max(x1 - x0 + 1, 128), max(y1 - y0 + 1, 128)          # кусок для LaMa не меньше 256
+            cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+            X0, X1 = max(0, cx - bw), min(W, cx + bw + 1)
+            Y0, Y1 = max(0, cy - bh), min(H, cy + bh + 1)
             crop, mc = plate[Y0:Y1, X0:X1], mj[Y0:Y1, X0:X1]
             k = min(1.0, 1024 / max(crop.shape[:2]))
             cs = cv2.resize(crop, None, fx=k, fy=k, interpolation=cv2.INTER_AREA) if k < 1 else crop
