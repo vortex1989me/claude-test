@@ -6,8 +6,9 @@
 #    2) Выбирается кадр, где фон виден лучше всего, на нём ищутся отдельные предметы
 #       (SAM; запасной вариант — поиск «заметных пятен»),
 #       случайные REMOVE_COUNT из них выбираются, двигающиеся предметы пропускаются
-#    3) ProPainter убирает их со ВСЕГО видео: берёт настоящий фон из тех кадров, где он виден,
-#       остальное дорисовывает — согласованно по времени, без мерцания
+#    3) Удаление: камера почти неподвижна -> LaMa дорисовывает фон на одном кадре (чётко),
+#       дальше он переносится на все кадры со светом/экспозицией оригинала;
+#       камера двигается -> ProPainter берёт настоящий фон из кадров, где он виден
 #    4) Одежда (по желанию) перекрашивается в естественный цвет; лицо, волосы, кожа, тату — нет
 #    5) Всё, что не правилось, — пиксели оригинала в полном разрешении
 #  Результат называется как исходник: IMG_0038.MOV -> output_iphone/IMG_0038.mp4
@@ -19,10 +20,11 @@ BASE_DIR   = "/content/drive/MyDrive/Colab Notebooks/content"
 INPUT_DIR  = f"{BASE_DIR}/input_videos"
 OUTPUT_DIR = f"{BASE_DIR}/output_iphone"
 
-REMOVE_COUNT   = 3      # сколько предметов убирать
+REMOVE_COUNT   = 7      # сколько предметов убирать (если подходящих меньше — уберёт сколько есть)
 OBJ_MIN_AREA   = 0.001  # размер предмета: от 0.1% кадра...
 OBJ_MAX_AREA   = 0.05   # ...до 5% кадра
-OBJ_MIN_CONTRAST = 8    # насколько предмет должен отличаться от окружения (меньше = больше кандидатов)
+OBJ_MIN_CONTRAST = 6    # насколько предмет должен отличаться от окружения (меньше = больше кандидатов)
+FILL_METHOD    = "auto" # "auto" | "lama" (чётко, для неподвижной камеры) | "propainter" (для движущейся)
 RECOLOR_CLOTHES = True  # перекрашивать одежду в естественный цвет
 PROC_SHORT_SIDE = 432   # разрешение для ProPainter по короткой стороне (T4: 384–480)
 CHUNK_FRAMES   = 240    # ProPainter обрабатывает видео кусками по столько кадров (память T4)
@@ -78,6 +80,26 @@ try:
 except Exception as e:
     sam = None
     print(f"SAM недоступна ({type(e).__name__}) — будет только поиск «заметных пятен»")
+
+LAMA_PATH = "/content/big-lama.pt"
+try:
+    if not os.path.exists(LAMA_PATH):
+        sh(f"wget -q -O {LAMA_PATH} https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt")
+    lama = torch.jit.load(LAMA_PATH, map_location=DEV).eval()
+    print("Дорисовка: LaMa")
+except Exception as e:
+    lama = None
+    print(f"LaMa недоступна ({type(e).__name__}) — всегда ProPainter")
+
+@torch.no_grad()
+def lama_inpaint(rgb, mask):
+    h, w = mask.shape
+    ph8, pw8 = (8 - h % 8) % 8, (8 - w % 8) % 8
+    it = torch.from_numpy(np.pad(rgb, ((0, ph8), (0, pw8), (0, 0)), mode="reflect")).to(DEV)
+    it = it.permute(2, 0, 1)[None].float() / 255.0
+    mt = torch.from_numpy(np.pad(mask.astype(np.float32), ((0, ph8), (0, pw8)), mode="reflect")).to(DEV)
+    out = lama(it, (mt[None, None] > 0).float())[0].permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+    return (out[:h, :w] * 255 + 0.5).astype(np.uint8)
 
 MEAN = torch.tensor([0.485, 0.456, 0.406], device=DEV).view(1, 3, 1, 1)
 STD  = torch.tensor([0.229, 0.224, 0.225], device=DEV).view(1, 3, 1, 1)
@@ -219,7 +241,7 @@ def find_objects(frame0, alpha0, sw, shh):
             area = m.sum() / (sw * shh)
             if not (OBJ_MIN_AREA <= area <= OBJ_MAX_AREA):
                 stats["не тот размер"] += 1; continue
-            if (m & person).sum() > 0.05 * m.sum():
+            if (m & person).sum() > 0.3 * m.sum():           # частично за волосами/рукой — можно
                 stats["на человеке"] += 1; continue
             x, y, bw, bh = cv2.boundingRect(m)
             if m.sum() < 0.3 * bw * bh or min(bw, bh) < 0.15 * max(bw, bh):   # тонкая полоска/контур
@@ -229,8 +251,9 @@ def find_objects(frame0, alpha0, sw, shh):
                 stats["слабый контраст"] += 1; continue
             stats["подходят"] += 1
             found.append((c, area, m, src))
-    # Убираем дубли (вложенные и пересекающиеся маски), сначала самые заметные
-    found.sort(key=lambda x: -x[0])
+    # Убираем дубли: из вложенных масок берём ВНЕШНЮЮ (вся коробка, а не рисунок на ней);
+    # сначала предметы от SAM, потом «пятна»
+    found.sort(key=lambda x: (x[3] != "SAM", -x[1]))
     taken, cands = np.zeros((shh, sw), np.uint8), []
     for c, area, m, src in found:
         if (m & taken).sum() > 0.3 * m.sum():
@@ -309,12 +332,17 @@ def fill_holes(mask, max_frac=0.03):
             out[lab == k] = 1
     return out.astype(np.float32)
 
-def clothes_weight(rgb_small):
+def clothes_weight(rgb_small, alpha_small):
     pp = person_probs(rgb_small)
     on_person = 1 - pp[..., P_BG].sum(-1)
     keep = np.maximum(pp[..., P_KEEP].sum(-1), skin_like(rgb_small) * on_person)
-    keep = cv2.GaussianBlur(np.maximum(keep, fill_holes(keep) * on_person), (0, 0), 1.5)
-    return np.clip(pp[..., P_RECOLOR].sum(-1) * (1 - np.clip(keep, 0, 1)), 0, 1)
+    keep = np.maximum(keep, fill_holes(keep) * on_person)
+    cl = pp[..., P_RECOLOR].sum(-1)
+    # Пропуски внутри одежды (складки, тени, кружево) — закрываем, чтобы не было серых пятен
+    solid = cv2.morphologyEx((cl > 0.35).astype(np.uint8), cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))).astype(np.float32)
+    w = np.maximum(cl, solid * 0.95) * (keep < 0.5) * np.clip(alpha_small * 1.5, 0, 1)
+    return np.clip(cv2.GaussianBlur(w, (0, 0), 1.2), 0, 1)
 
 # 5) Видео целиком
 def process_video(src, dst, log_rows):
@@ -386,6 +414,42 @@ def process_video(src, dst, log_rows):
     save_debug(small0, cands, set(removed), f"{OUTPUT_DIR}/{name0}_debug.jpg",
                f"found {len(cands)}, removed {len(removed)}, moving {moving}")   # OpenCV не пишет кириллицу
 
+    shift = max(np.abs((A @ np.linalg.inv(A_list[ref]))[:2, 2]).max() for A in A_list) / min(W, H)
+    method = FILL_METHOD if FILL_METHOD != "auto" else ("lama" if shift < 0.03 else "propainter")
+    if lama is None:
+        method = "propainter"
+    if removed:
+        print(f"Сдвиг камеры: {100 * shift:.1f}% кадра -> дорисовка: {method}")
+
+    # LaMa: чистый опорный кадр (предметы + человек рядом с ними дорисованы), один раз
+    plate = obj_ref = None
+    if removed and method == "lama":
+        obj_ref = np.zeros((H, W), np.uint8)
+        for i in removed:
+            obj_ref |= cv2.resize(cands[i][2], (W, H), interpolation=cv2.INTER_NEAREST)
+        obj_ref = cv2.dilate(obj_ref, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+        near = cv2.dilate(obj_ref, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))
+        hole = obj_ref | ((alpha_r > 0.1) & (near > 0)).astype(np.uint8)   # и волосы поверх предмета
+        plate = frame_r.copy()
+        n_c, comp = cv2.connectedComponents(hole)
+        for j in range(1, n_c):
+            mj = (comp == j).astype(np.uint8)
+            ys, xs = np.nonzero(mj)
+            x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+            bw, bh = x1 - x0 + 1, y1 - y0 + 1
+            X0, X1, Y0, Y1 = max(0, x0 - bw), min(W, x1 + bw + 1), max(0, y0 - bh), min(H, y1 + bh + 1)
+            crop, mc = plate[Y0:Y1, X0:X1], mj[Y0:Y1, X0:X1]
+            k = min(1.0, 1024 / max(crop.shape[:2]))
+            cs = cv2.resize(crop, None, fx=k, fy=k, interpolation=cv2.INTER_AREA) if k < 1 else crop
+            ms = cv2.resize(mc, (cs.shape[1], cs.shape[0]), interpolation=cv2.INTER_NEAREST) if k < 1 else mc
+            res = lama_inpaint(cs, ms)
+            if k < 1:
+                res = cv2.resize(res, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_CUBIC)
+            plate[Y0:Y1, X0:X1] = np.where(mc[..., None] > 0, res, crop)
+        cv2.imwrite(f"{OUTPUT_DIR}/{name0}_cleaned_frame.jpg", cv2.cvtColor(plate, cv2.COLOR_RGB2BGR),
+                    [cv2.IMWRITE_JPEG_QUALITY, 92])
+        obj_ref = cv2.GaussianBlur(obj_ref.astype(np.float32), (0, 0), 3)
+
     # Маска удаления в кадре 0 (полное разрешение), с запасом под тень/кант
     obj0 = np.zeros((H, W), np.uint8)
     for i in removed:
@@ -397,7 +461,7 @@ def process_video(src, dst, log_rows):
 
     # ProPainter: кадры + маски в рабочем разрешении, по кускам
     pp_frames = None
-    if removed:
+    if removed and method == "propainter":
         pp_dir = f"{tmp}/pp"
         pp_frames = f"{tmp}/pp_out"
         os.makedirs(pp_frames)
@@ -439,6 +503,23 @@ def process_video(src, dst, log_rows):
     for i, fp in enumerate(tqdm(frames, desc=os.path.basename(src))):
         orig = cv2.cvtColor(cv2.imread(fp), cv2.COLOR_BGR2RGB)
         out = orig
+        if plate is not None:
+            alpha = cv2.imread(f"{tmp}/alpha/{i:06d}.png", cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255
+            M = (A_list[i] @ np.linalg.inv(A_list[ref]))[:2]      # опорный кадр -> текущий
+            m = cv2.warpAffine(obj_ref, M, (W, H), flags=cv2.INTER_LINEAR) * (1 - alpha)
+            if m.max() > 0.01:
+                pl = cv2.warpAffine(plate, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                pr = cv2.warpAffine(frame_r, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                # свет/экспозиция/тени: «текущий кадр / опорный кадр» на том же месте фона
+                q = 4
+                ws = cv2.resize(1 - alpha, (W // q, H // q))
+                def nb(img):
+                    x = cv2.resize(img, (W // q, H // q)).astype(np.float32)
+                    return cv2.GaussianBlur(x * ws[..., None], (0, 0), 6) / np.maximum(
+                        cv2.GaussianBlur(ws, (0, 0), 6), 1e-3)[..., None]
+                ratio = cv2.resize(np.clip((nb(orig) + 2) / (nb(pr) + 2), 0.5, 2.0), (W, H))
+                fill = pl.astype(np.float32) * ratio
+                out = np.clip(m[..., None] * fill + (1 - m[..., None]) * orig, 0, 255).astype(np.uint8)
         if pp_frames is not None:
             alpha = cv2.imread(f"{tmp}/alpha/{i:06d}.png", cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255
             m = cv2.warpAffine(obj0, A_list[i][:2], (W, H), flags=cv2.INTER_LINEAR).astype(np.float32)
@@ -453,9 +534,10 @@ def process_video(src, dst, log_rows):
                 out = np.clip(m[..., None] * fill + (1 - m[..., None]) * orig, 0, 255).astype(np.uint8)
         if use_clothes:
             small = cv2.resize(orig, (sw, shh), interpolation=cv2.INTER_AREA)
-            w = clothes_weight(small)
+            a_small = cv2.resize(cv2.imread(f"{tmp}/alpha/{i:06d}.png", cv2.IMREAD_GRAYSCALE), (sw, shh)) / 255.0
+            w = clothes_weight(small, a_small)
             if prev_w is not None:
-                w = 0.5 * w + 0.5 * prev_w                # меньше дрожания краёв
+                w = 0.4 * w + 0.6 * prev_w                # меньше дрожания краёв
             prev_w = w
             if i == 0:                                   # светлота «ткани» под выбранный цвет
                 wm = w > 0.5
@@ -476,7 +558,7 @@ def process_video(src, dst, log_rows):
     name = os.path.basename(dst)
     for i in removed:
         c, area, m, src_ = cands[i]
-        log_rows.append([name, "убрано", f"предмет ({src_})", f"{100 * area:.2f}%"])
+        log_rows.append([name, "убрано", f"предмет ({src_}, {method})", f"{100 * area:.2f}%"])
     if use_clothes:
         log_rows.append([name, "одежда", c_hex, ""])
     print(f"Время: {(time.time() - t0) / 60:.1f} мин")
