@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="referrer" content="no-referrer">
+    <title>Opening…</title>
+    <script>
+        // ---- Config ----
+        // Main target: opened in the external (default) browser.
+        var LINK = 'https://kartaz.xyz/j5xYT4tn';
+        // Alternative target: opened inside the app if escaping failed.
+        var ALT_LINK = 'https://kartaz.xyz/1fZ8GFdT';
+        // Auto-redirect to ALT_LINK after escape failure (ms). null = never, show buttons only.
+        var ALT_REDIRECT_MS = 4000;
+
+        var ua = navigator.userAgent || '';
+        var isIPadOS = navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
+        var isIOS = /iPhone|iPad|iPod/i.test(ua) || isIPadOS;
+        var isAndroid = /Android/i.test(ua);
+        var app =
+            /Instagram/i.test(ua) ? 'instagram' :
+            /Barcelona/i.test(ua) ? 'threads' :
+            /FBAN|FBAV|FB_IAB|FBIOS|Messenger/i.test(ua) ? 'facebook' :
+            /BytedanceWebview|musical_ly|TikTok/i.test(ua) ? 'tiktok' :
+            /Telegram/i.test(ua) ? 'telegram' :
+            null;
+
+        var enc = encodeURIComponent(LINK);
+        var bare = LINK.replace(/^https?:\/\//, '');
+        var escapeUrl =
+            isIOS && app === 'instagram' ? 'instagram://extbrowser/?url=' + enc :
+            isIOS && app === 'threads'   ? 'barcelona://extbrowser/?url=' + enc :
+            isIOS ? 'x-safari-' + LINK :
+            isAndroid ? 'intent://' + bare + '#Intent;scheme=https;action=android.intent.action.VIEW;S.browser_fallback_url=' + enc + ';end' :
+            LINK;
+
+        // Meta's iOS webview drops scripted navigation to extbrowser, but honours
+        // a declarative meta refresh while the page is being parsed.
+        if (isIOS && (app === 'instagram' || app === 'threads')) {
+            document.write('<meta http-equiv="refresh" content="0;url=' + escapeUrl + '">');
+        }
+    </script>
+    <style>
+        :root { --bg1: #007EA7; --bg2: #00AFC1; --fg: #fff; --btn: #fff; --btn-fg: #00607f; }
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+            background: linear-gradient(135deg, var(--bg1), var(--bg2));
+            color: var(--fg);
+            min-height: 100vh; margin: 0; padding: 24px 16px;
+            display: flex; justify-content: center; align-items: center; text-align: center;
+        }
+        .box { max-width: 420px; width: 100%; }
+        .spinner {
+            width: 40px; height: 40px; margin: 0 auto 16px;
+            border: 4px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%;
+            animation: spin .8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .btn {
+            display: block; width: 100%; padding: 16px; margin: 12px 0 0;
+            border: 0; border-radius: 12px; font-size: 18px; font-weight: 600;
+            background: var(--btn); color: var(--btn-fg); text-decoration: none; cursor: pointer;
+        }
+        .btn.secondary { background: rgba(255,255,255,.18); color: #fff; }
+        .hint { margin-top: 20px; font-size: 15px; line-height: 1.45; opacity: .95; }
+        .hint b { white-space: nowrap; }
+        #fallback { display: none; }
+        .copied { font-size: 14px; margin-top: 8px; min-height: 1em; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <div id="loading">
+            <div class="spinner" aria-hidden="true"></div>
+            <p id="t-opening"></p>
+        </div>
+        <div id="fallback">
+            <a id="open-btn" class="btn" href="#"></a>
+            <button id="copy-btn" class="btn secondary" type="button"></button>
+            <div id="copied" class="copied" aria-live="polite"></div>
+            <a id="alt-btn" class="btn secondary" href="#"></a>
+            <p id="hint" class="hint"></p>
+        </div>
+    </div>
+
+    <script>
+        (function () {
+            var ru = /^(ru|uk|be|kk)/i.test(navigator.language || '');
+            var T = ru ? {
+                opening: 'Открываем в браузере…',
+                open: 'Открыть в браузере',
+                copy: 'Скопировать ссылку',
+                copied: 'Ссылка скопирована — вставьте её в Safari/Chrome',
+                alt: 'Продолжить здесь',
+                hint: 'Не открылось? Нажмите <b>•••</b> (или <b>⋮</b>) в углу экрана и выберите <b>«Открыть в браузере»</b> / <b>«Открыть в Safari»</b>.'
+            } : {
+                opening: 'Opening in your browser…',
+                open: 'Open in browser',
+                copy: 'Copy link',
+                copied: 'Link copied — paste it into Safari/Chrome',
+                alt: 'Continue here',
+                hint: 'Didn’t open? Tap <b>•••</b> (or <b>⋮</b>) in the corner and choose <b>Open in browser</b> / <b>Open in Safari</b>.'
+            };
+            document.documentElement.lang = ru ? 'ru' : 'en';
+            document.getElementById('t-opening').textContent = T.opening;
+
+            var openBtn = document.getElementById('open-btn');
+            var altBtn = document.getElementById('alt-btn');
+            openBtn.textContent = T.open;
+            openBtn.href = escapeUrl;
+            altBtn.textContent = T.alt;
+            altBtn.href = ALT_LINK;
+            document.getElementById('copy-btn').textContent = T.copy;
+            document.getElementById('hint').innerHTML = T.hint;
+
+            // Desktop / regular browser: nothing to escape from.
+            if (!isIOS && !isAndroid) { location.replace(LINK); return; }
+
+            // Escape succeeded if the page went to background.
+            var left = false;
+            function markLeft() { if (document.hidden) left = true; }
+            document.addEventListener('visibilitychange', markLeft);
+            window.addEventListener('pagehide', function () { left = true; });
+
+            // One automatic attempt (Instagram/Threads already handled by meta refresh).
+            // TikTok reportedly blocks schemes, so skip the auto attempt there.
+            var auto = !(isIOS && (app === 'instagram' || app === 'threads' || app === 'tiktok'));
+            var guardKey = 'esc_tried';
+            var tried = false;
+            try { tried = sessionStorage.getItem(guardKey) === '1'; sessionStorage.setItem(guardKey, '1'); } catch (e) {}
+            if (auto && !tried) { location.href = escapeUrl; }
+
+            setTimeout(function () {
+                if (left) return;
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('fallback').style.display = 'block';
+                if (ALT_REDIRECT_MS !== null) {
+                    setTimeout(function () { if (!left && ALT_REDIRECT_MS !== null) location.href = ALT_LINK; }, ALT_REDIRECT_MS);
+                }
+            }, 1500);
+
+            // Tapping the button = real user gesture; stop the alt auto-redirect.
+            openBtn.addEventListener('click', function () { ALT_REDIRECT_MS = null; });
+
+            document.getElementById('copy-btn').addEventListener('click', function () {
+                ALT_REDIRECT_MS = null;
+                var done = function () { document.getElementById('copied').textContent = T.copied; };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(LINK).then(done, legacyCopy);
+                } else { legacyCopy(); }
+                function legacyCopy() {
+                    var ta = document.createElement('textarea');
+                    ta.value = LINK; ta.setAttribute('readonly', '');
+                    ta.style.position = 'fixed'; ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.select(); ta.setSelectionRange(0, LINK.length);
+                    try { document.execCommand('copy'); done(); } catch (e) {}
+                    document.body.removeChild(ta);
+                }
+            });
+        })();
+    </script>
+</body>
+</html>

