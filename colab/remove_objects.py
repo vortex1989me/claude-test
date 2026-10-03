@@ -3,7 +3,8 @@
 #  Drive: Мой диск/Colab Notebooks/content/input_videos  ->  .../output_iphone
 #  Для каждого видео:
 #    1) HFLIP
-#    2) Выбирается кадр, где фон виден лучше всего, на нём ищутся ОТДЕЛЬНЫЕ НЕБОЛЬШИЕ предметы
+#    2) Из всех кадров собирается «чистый фон» (где человек закрывал фон в одном кадре —
+#       этот участок берётся из другого кадра, где человек отошёл). На нём ищутся ОТДЕЛЬНЫЕ НЕБОЛЬШИЕ предметы
 #       (SAM режет кадр на куски, ADE20K говорит, что это: шкафы/двери/стены/окна/кровати и т.п.
 #       не трогаются никогда; куски у края кадра, полоски и крупные области — тоже).
 #       REMOVE_COUNT — это МАКСИМУМ: если подходящих 2, уберутся 2. Двигающиеся предметы пропускаются
@@ -418,10 +419,45 @@ def find_objects(frame0, alpha0, sw, shh, diag_path=None):
         cv2.imwrite(diag_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])
     return cands, small, outdoor
 
-def is_static(obj_full, frames, alphas_dir, A_list, idxs, W, H, ref):
-    """Предмет не двигается сам (люди, машины, волны): сравнение с опорным кадром после
+def build_background(frames, alphas_dir, A_list, ref, W, H, samples=40):
+    """Чистый фон в координатах опорного кадра: участки, закрытые человеком в опорном кадре,
+    берутся из других кадров (ближайших по времени), где фон там виден. Возвращает фон и маску
+    «фон не виден ни в одном кадре»."""
+    n = len(frames)
+    ts = sorted(set(np.linspace(0, n - 1, min(n, samples)).astype(int).tolist()) - {ref},
+                key=lambda t: abs(t - ref))
+    bg = cv2.cvtColor(cv2.imread(frames[ref]), cv2.COLOR_BGR2RGB).astype(np.float32)
+    a_ref = cv2.imread(f"{alphas_dir}/{ref:06d}.png", cv2.IMREAD_GRAYSCALE)
+    k = np.ones((21, 21), np.uint8)
+    base = cv2.dilate((a_ref > 12).astype(np.uint8), k) == 0      # фон, видимый в опорном кадре
+    filled = base.copy()
+    ones = np.ones((H, W), np.uint8)
+    for t in ts:
+        if filled.mean() > 0.995:
+            break
+        M = (A_list[t] @ np.linalg.inv(A_list[ref]))[:2]          # опорный кадр -> кадр t
+        ft = cv2.warpAffine(cv2.cvtColor(cv2.imread(frames[t]), cv2.COLOR_BGR2RGB), M, (W, H),
+                            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE)
+        at = cv2.warpAffine(cv2.imread(f"{alphas_dir}/{t:06d}.png", cv2.IMREAD_GRAYSCALE), M, (W, H),
+                            flags=cv2.WARP_INVERSE_MAP, borderValue=255)
+        inside = cv2.warpAffine(ones, M, (W, H), flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP) > 0
+        vis = (cv2.dilate((at > 12).astype(np.uint8), k) == 0) & inside
+        new = vis & ~filled
+        if new.sum() < 200:
+            continue
+        common = vis & base
+        ft = ft.astype(np.float32)
+        if common.sum() > 2000:                                    # подгонка экспозиции под опорный кадр
+            ft *= np.clip(bg[common].mean(0) / np.maximum(ft[common].mean(0), 1), 0.7, 1.4)
+        bg[new] = ft[new]
+        filled |= vis
+    print(f"Чистый фон: виден {100 * filled.mean():.0f}% кадра (остальное всё время закрыто человеком)")
+    return np.clip(bg, 0, 255).astype(np.uint8), ~filled
+
+def is_static(obj_full, frames, alphas_dir, A_list, idxs, W, H, ref, bg_ref):
+    """Предмет не двигается сам (люди, машины, волны): сравнение с чистым фоном после
     компенсации движения камеры и автоэкспозиции."""
-    f0 = cv2.cvtColor(cv2.imread(frames[ref]), cv2.COLOR_BGR2RGB).astype(np.float32)
+    f0 = bg_ref.astype(np.float32)
     ring = cv2.dilate(obj_full, np.ones((31, 31), np.uint8)) - obj_full
     checked = fails = 0
     for t in idxs:
@@ -561,8 +597,9 @@ def process_video(src, dst, log_rows):
              for i in range(0, n, max(1, n // 40))]
     ref = int(np.argmin(areas)) * max(1, n // 40)
     print(f"Опорный кадр: {ref} (человек занимает {100 * min(areas):.0f}% кадра)")
-    frame_r = cv2.cvtColor(cv2.imread(frames[ref]), cv2.COLOR_BGR2RGB)
-    alpha_r = cv2.imread(f"{tmp}/alpha/{ref:06d}.png", cv2.IMREAD_GRAYSCALE) / 255.0
+    # Чистый фон из всех кадров: предметы, закрытые человеком в опорном кадре, тоже находятся
+    frame_r, never = build_background(frames, f"{tmp}/alpha", A_list, ref, W, H)
+    alpha_r = never.astype(np.float32)                 # «человек» = там, где фон не виден никогда
     name0 = os.path.splitext(os.path.basename(dst))[0]
     cands, small0, outdoor = find_objects(frame_r, alpha_r, sw, shh, f"{OUTPUT_DIR}/{name0}_candidates.jpg")
     # Сначала опознанные предметы (коробки, бутылки, вазы, книги...) в случайном порядке,
@@ -577,7 +614,7 @@ def process_video(src, dst, log_rows):
         if len(removed) >= REMOVE_COUNT:
             break
         obj_full = cv2.resize(cands[i]["m"], (W, H), interpolation=cv2.INTER_NEAREST)
-        if is_static(obj_full, frames, f"{tmp}/alpha", A_list, idxs, W, H, ref):
+        if is_static(obj_full, frames, f"{tmp}/alpha", A_list, idxs, W, H, ref, frame_r):
             removed.append(i)
         else:
             moving += 1
