@@ -99,9 +99,9 @@ def get_video_info(path):
 def build_transpose_filter(rotation):
     r = rotation % 360
     if r == 90 or r == -270:
-        return "transpose=1"
-    elif r == -90 or r == 270:
         return "transpose=2"
+    elif r == -90 or r == 270:
+        return "transpose=1"
     elif r == 180 or r == -180:
         return "transpose=1,transpose=1"
     return None
