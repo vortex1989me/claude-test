@@ -1,47 +1,70 @@
 #!/usr/bin/env python3
 """
-TikTok Video Uniqualizer — bypasses 5-layer duplicate detection:
-  1. File hash (SHA-256) — re-encode breaks it
-  2. Perceptual hash (TMK+PDQF/PDQ) — mesh warp + DCT butterfly
-  3. Audio fingerprint (constellation map) — phantom peak injection
-  4. Deep learning (CLIP/ViT) — attention dilution in uniform areas
-  5. Invisible watermarks (C2PA) — CRF re-encode strips mid-freq DCT
+TikTok Video Uniqualizer v3 — hardened version.
+Deterministic: same input = same output (seed from file hash).
 
-Pipeline: ffmpeg decode → per-frame Python processing → ffmpeg encode
-Memory: ~6 MB per frame (pipe-based, one frame at a time)
+Breaks all 5 detection layers:
+  1. File hash — re-encode
+  2. Perceptual hash (TMK+PDQF 64x64@15fps) — heavy mesh warp + perspective
+  3. Audio fingerprint — non-uniform time warp + STFT poisoning + stereo rotation
+  4. Deep learning (CLIP/ViT) — gradient overlay + attention dilution + color shift
+  5. C2PA watermarks — aggressive DCT butterfly (above error-correction threshold)
 """
 
 import os
 import sys
-import struct
 import subprocess
 import random
 import json
 import wave
 import math
 import time
+import hashlib
 from pathlib import Path
 
 import numpy as np
 import cv2
 
 # ─── Config ───────────────────────────────────────────────────────────
-SPEED = 1.02
-PITCH_FACTOR = 1.02
-CRF = 22
+SPEED = 1.03
+PITCH_FACTOR = 1.03
+CRF = 21
 PRESET = "medium"
-CROP_PX = 3
-MESH_GRID = 8
-MESH_AMP = 2.0
-DCT_STRENGTH = 0.08
-NOISE_STRENGTH = 3
-DILUTION_AMP = 4
-DILUTION_THRESHOLD = 12
+CROP_PX = 10
+MESH_GRID = 12
+MESH_AMP = 7.0
+DCT_STRENGTH = 0.25
+NOISE_STRENGTH = 5
+DILUTION_AMP = 7
+DILUTION_THRESHOLD = 20
+COLOR_SHIFT_DEG = 6
+GAMMA_SHIFT = 0.08
+ZOOM_DRIFT_MAX = 0.03
+BLEND_ALPHA = 0.10
+CHROMA_NOISE = 8
+PERSPECTIVE_AMP = 3.0
+GRADIENT_OPACITY = 0.035
+FRAME_SWAP_INTERVAL = 25
 AUDIO_PHANTOM_OFFSET_HZ = 75
-AUDIO_PHANTOM_AMP = 0.80
+AUDIO_PHANTOM_AMP = 0.85
+AUDIO_WOBBLE_HZ = 3.5
+AUDIO_WOBBLE_DEPTH = 0.05
+AUDIO_WARP_SEGMENTS = 20
+AUDIO_WARP_RANGE = (0.97, 1.04)
+STEREO_ROTATION_DEG = 10
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
 SUPPORTED_EXT = {".mp4", ".mov", ".MP4", ".MOV"}
+
+
+def compute_file_seed(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read(1024 * 1024))
+        f.seek(0, 2)
+        h.update(str(f.tell()).encode())
+    h.update(os.path.basename(path).encode())
+    return int.from_bytes(h.digest()[:4], "big")
 
 
 def get_video_info(path):
@@ -64,10 +87,8 @@ def get_video_info(path):
     if vstream:
         rotation = int(vstream.get("rotation", 0))
         if rotation == 0:
-            for tag_key in ("tags",):
-                tags = vstream.get(tag_key, {})
-                rot = tags.get("rotate", "0")
-                rotation = int(rot)
+            tags = vstream.get("tags", {})
+            rotation = int(tags.get("rotate", "0"))
         if "side_data_list" in vstream:
             for sd in vstream["side_data_list"]:
                 if sd.get("side_data_type") == "Display Matrix" and "rotation" in sd:
@@ -84,7 +105,6 @@ def get_video_info(path):
         fps = float(fps_str)
 
     duration = float(data.get("format", {}).get("duration", 0))
-
     has_audio = astream is not None
     audio_sr = int(float(astream.get("sample_rate", 44100))) if astream else 44100
     audio_ch = int(astream.get("channels", 2)) if astream else 2
@@ -119,11 +139,6 @@ def get_display_dims(w, h, rotation):
 def mesh_warp(frame):
     h, w = frame.shape[:2]
     grid = MESH_GRID
-    map_x = np.zeros((h, w), dtype=np.float32)
-    map_y = np.zeros((h, w), dtype=np.float32)
-
-    ctrl_y = np.linspace(0, h, grid + 1)
-    ctrl_x = np.linspace(0, w, grid + 1)
 
     dx = np.random.uniform(-MESH_AMP, MESH_AMP, (grid + 1, grid + 1)).astype(np.float32)
     dy = np.random.uniform(-MESH_AMP, MESH_AMP, (grid + 1, grid + 1)).astype(np.float32)
@@ -133,15 +148,27 @@ def mesh_warp(frame):
     full_dx = cv2.resize(dx, (w, h), interpolation=cv2.INTER_LINEAR)
     full_dy = cv2.resize(dy, (w, h), interpolation=cv2.INTER_LINEAR)
 
-    base_x = np.arange(w, dtype=np.float32)[np.newaxis, :]
-    base_y = np.arange(h, dtype=np.float32)[:, np.newaxis]
-    base_x = np.broadcast_to(base_x, (h, w)).copy()
-    base_y = np.broadcast_to(base_y, (h, w)).copy()
+    base_x = np.broadcast_to(np.arange(w, dtype=np.float32)[np.newaxis, :], (h, w)).copy()
+    base_y = np.broadcast_to(np.arange(h, dtype=np.float32)[:, np.newaxis], (h, w)).copy()
 
-    map_x = base_x + full_dx
-    map_y = base_y + full_dy
+    return cv2.remap(frame, base_x + full_dx, base_y + full_dy,
+                     cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
 
-    return cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+
+def perspective_transform(frame):
+    h, w = frame.shape[:2]
+    amp = PERSPECTIVE_AMP
+
+    src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    dst = np.float32([
+        [np.random.uniform(0, amp), np.random.uniform(0, amp)],
+        [w - np.random.uniform(0, amp), np.random.uniform(0, amp)],
+        [w - np.random.uniform(0, amp), h - np.random.uniform(0, amp)],
+        [np.random.uniform(0, amp), h - np.random.uniform(0, amp)]
+    ])
+
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(frame, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
 
 
 def dct_butterfly(frame):
@@ -150,20 +177,103 @@ def dct_butterfly(frame):
 
     dft = np.fft.fft2(y_ch)
     h, w = y_ch.shape
-    mid_h = slice(h // 4, 3 * h // 4)
-    mid_w = slice(w // 4, 3 * w // 4)
 
-    perturbation = np.random.normal(0, DCT_STRENGTH, dft[mid_h, mid_w].shape)
-    magnitude = np.abs(dft[mid_h, mid_w])
-    median_mag = np.median(magnitude[magnitude > 0]) if np.any(magnitude > 0) else 1.0
-    mask = (magnitude > median_mag * 0.5) & (magnitude < median_mag * 2.0)
+    for band_h, band_w in [(slice(h//6, 5*h//6), slice(w//6, 5*w//6)),
+                            (slice(h//3, 2*h//3), slice(w//3, 2*w//3))]:
+        perturbation = np.random.normal(0, DCT_STRENGTH, dft[band_h, band_w].shape)
+        magnitude = np.abs(dft[band_h, band_w])
+        median_mag = np.median(magnitude[magnitude > 0]) if np.any(magnitude > 0) else 1.0
+        mask = (magnitude > median_mag * 0.2) & (magnitude < median_mag * 5.0)
+        dft[band_h, band_w] += perturbation * mask * median_mag
 
-    dft[mid_h, mid_w] += perturbation * mask * median_mag
-
-    y_new = np.fft.ifft2(dft).real
-    y_new = np.clip(y_new, 0, 255).astype(np.uint8)
+    y_new = np.clip(np.fft.ifft2(dft).real, 0, 255).astype(np.uint8)
     yuv[:, :, 0] = y_new
     return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+
+
+def color_shift(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.int16)
+    shift = random.randint(-COLOR_SHIFT_DEG, COLOR_SHIFT_DEG)
+    hsv[:, :, 0] = (hsv[:, :, 0] + shift) % 180
+    sat_factor = random.uniform(0.94, 1.06)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_factor, 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+
+def gamma_shift(frame):
+    shift = random.uniform(-GAMMA_SHIFT, GAMMA_SHIFT)
+    gamma = 1.0 + shift
+    inv_gamma = 1.0 / gamma
+    table = np.array([
+        np.clip(((i / 255.0) ** inv_gamma) * 255.0, 0, 255)
+        for i in range(256)
+    ], dtype=np.uint8)
+    return cv2.LUT(frame, table)
+
+
+def chroma_noise(frame):
+    yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
+    noise_u = np.random.randint(-CHROMA_NOISE, CHROMA_NOISE + 1,
+                                yuv[:, :, 1].shape, dtype=np.int16)
+    noise_v = np.random.randint(-CHROMA_NOISE, CHROMA_NOISE + 1,
+                                yuv[:, :, 2].shape, dtype=np.int16)
+    yuv[:, :, 1] = np.clip(yuv[:, :, 1].astype(np.int16) + noise_u, 0, 255).astype(np.uint8)
+    yuv[:, :, 2] = np.clip(yuv[:, :, 2].astype(np.int16) + noise_v, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+
+
+def luma_noise(frame):
+    noise = np.random.randint(-NOISE_STRENGTH, NOISE_STRENGTH + 1,
+                              frame.shape, dtype=np.int16)
+    return np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+
+def zoom_drift(frame, frame_idx, total_frames):
+    if total_frames <= 0:
+        total_frames = 300
+    t = frame_idx / total_frames
+    zoom = 1.0 + ZOOM_DRIFT_MAX * math.sin(2 * math.pi * t * 1.3)
+
+    h, w = frame.shape[:2]
+    cx, cy = w / 2, h / 2
+    new_w, new_h = int(w / zoom), int(h / zoom)
+    x1 = max(0, min(int(cx - new_w / 2), w - new_w))
+    y1 = max(0, min(int(cy - new_h / 2), h - new_h))
+
+    cropped = frame[y1:y1 + new_h, x1:x1 + new_w]
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def gradient_overlay(frame, frame_idx, total_frames):
+    h, w = frame.shape[:2]
+    if total_frames <= 0:
+        total_frames = 300
+    t = frame_idx / total_frames
+
+    angle = t * 2 * math.pi * 0.7
+    cx = int(w * (0.5 + 0.4 * math.cos(angle)))
+    cy = int(h * (0.5 + 0.4 * math.sin(angle)))
+
+    Y, X = np.ogrid[:h, :w]
+    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2).astype(np.float32)
+    max_dist = math.sqrt(w * w + h * h)
+    gradient = (dist / max_dist * 255).astype(np.float32)
+
+    overlay = np.zeros((h, w, 3), dtype=np.float32)
+    r_tint = random.randint(200, 255) if frame_idx == 0 else gradient_overlay._tint[0]
+    g_tint = random.randint(180, 240) if frame_idx == 0 else gradient_overlay._tint[1]
+    b_tint = random.randint(160, 220) if frame_idx == 0 else gradient_overlay._tint[2]
+    if frame_idx == 0:
+        gradient_overlay._tint = (r_tint, g_tint, b_tint)
+
+    overlay[:, :, 0] = gradient * (b_tint / 255.0)
+    overlay[:, :, 1] = gradient * (g_tint / 255.0)
+    overlay[:, :, 2] = gradient * (r_tint / 255.0)
+
+    result = frame.astype(np.float32) * (1 - GRADIENT_OPACITY) + overlay * GRADIENT_OPACITY
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+gradient_overlay._tint = (230, 210, 190)
 
 
 def attention_dilution(frame):
@@ -180,19 +290,48 @@ def attention_dilution(frame):
                     -DILUTION_AMP, DILUTION_AMP + 1,
                     (block, block, 3), dtype=np.int16
                 )
-                blk = result[by:by + block, bx:bx + block].astype(np.int16)
-                blk += texture
+                blk = result[by:by + block, bx:bx + block].astype(np.int16) + texture
                 result[by:by + block, bx:bx + block] = np.clip(blk, 0, 255).astype(np.uint8)
 
     return result
 
 
-def process_frame(frame, frame_idx):
+prev_frame = None
+frame_buffer = None
+
+def process_frame(frame, frame_idx, total_frames):
+    global prev_frame, frame_buffer
+
     frame = mesh_warp(frame)
-    if frame_idx % 3 == 0:
-        frame = dct_butterfly(frame)
+    frame = perspective_transform(frame)
+    frame = dct_butterfly(frame)
+    frame = color_shift(frame)
+    frame = gamma_shift(frame)
+    frame = chroma_noise(frame)
+    frame = luma_noise(frame)
+    frame = zoom_drift(frame, frame_idx, total_frames)
+    frame = gradient_overlay(frame, frame_idx, total_frames)
     frame = attention_dilution(frame)
-    return frame
+
+    if prev_frame is not None and prev_frame.shape == frame.shape:
+        frame = cv2.addWeighted(frame, 1.0 - BLEND_ALPHA, prev_frame, BLEND_ALPHA, 0)
+
+    prev_frame = frame.copy()
+
+    if frame_idx % FRAME_SWAP_INTERVAL == 0 and frame_buffer is not None:
+        out = frame_buffer
+        frame_buffer = frame
+        return out
+    elif frame_idx % FRAME_SWAP_INTERVAL == 0:
+        frame_buffer = frame
+        return None
+    elif frame_buffer is not None:
+        out = frame
+        buffered = frame_buffer
+        frame_buffer = None
+        return (buffered, out)
+    else:
+        return frame
 
 
 # ─── Audio Processing ─────────────────────────────────────────────────
@@ -228,31 +367,90 @@ def save_wav(path, samples, params):
         wf.writeframes(flat.tobytes())
 
 
-def constellation_poison_mono(audio, sr):
+def nonuniform_time_warp(audio, sr):
     n = len(audio)
-    spectrum = np.fft.rfft(audio)
-    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    seg_len = n // AUDIO_WARP_SEGMENTS
+    if seg_len < 100:
+        return audio
 
-    n_peaks = max(5, n // sr * 3)
-    peak_indices = np.argsort(np.abs(spectrum))[-n_peaks:]
+    segments = []
+    for i in range(AUDIO_WARP_SEGMENTS):
+        start = i * seg_len
+        end = start + seg_len if i < AUDIO_WARP_SEGMENTS - 1 else n
+        seg = audio[start:end]
 
-    for idx in peak_indices:
-        if idx < len(freqs):
-            freq = freqs[idx]
-            offset_freq = freq + AUDIO_PHANTOM_OFFSET_HZ
-            neg_offset_freq = freq - AUDIO_PHANTOM_OFFSET_HZ
+        factor = np.random.uniform(AUDIO_WARP_RANGE[0], AUDIO_WARP_RANGE[1])
+        new_len = int(len(seg) / factor)
+        if new_len < 10:
+            segments.append(seg)
+            continue
 
-            for target_f in [offset_freq, neg_offset_freq]:
+        x_old = np.linspace(0, 1, len(seg))
+        x_new = np.linspace(0, 1, new_len)
+        resampled = np.interp(x_new, x_old, seg)
+        segments.append(resampled)
+
+    return np.concatenate(segments)
+
+
+def stft_constellation_poison(audio, sr):
+    win_size = 2048
+    hop = 512
+    n = len(audio)
+    result = audio.copy()
+
+    for start in range(0, n - win_size, hop):
+        window = result[start:start + win_size].copy()
+        spectrum = np.fft.rfft(window)
+        magnitudes = np.abs(spectrum)
+        top_k = min(10, len(magnitudes))
+        peak_indices = np.argsort(magnitudes)[-top_k:]
+
+        for idx in peak_indices:
+            freq = idx * sr / win_size
+            for offset in [AUDIO_PHANTOM_OFFSET_HZ, -AUDIO_PHANTOM_OFFSET_HZ,
+                           AUDIO_PHANTOM_OFFSET_HZ * 2, -AUDIO_PHANTOM_OFFSET_HZ * 2]:
+                target_f = freq + offset
                 if 20 < target_f < sr / 2:
-                    target_idx = int(target_f * n / sr)
+                    target_idx = int(target_f * win_size / sr)
                     if 0 < target_idx < len(spectrum):
                         phase = np.random.uniform(0, 2 * np.pi)
                         spectrum[target_idx] += (
-                            np.abs(spectrum[idx]) * AUDIO_PHANTOM_AMP * np.exp(1j * phase)
+                            magnitudes[idx] * AUDIO_PHANTOM_AMP * np.exp(1j * phase)
                         )
 
-    result = np.fft.irfft(spectrum, n=n)
+        poisoned = np.fft.irfft(spectrum, n=win_size)
+        hann = np.hanning(win_size)
+        result[start:start + win_size] = (
+            result[start:start + win_size] * (1 - hann) + poisoned * hann
+        )
+
     return result
+
+
+def amplitude_wobble(audio, sr):
+    n = len(audio)
+    t = np.arange(n, dtype=np.float64) / sr
+    wobble = 1.0 + AUDIO_WOBBLE_DEPTH * np.sin(2 * np.pi * AUDIO_WOBBLE_HZ * t)
+    return audio * wobble
+
+
+def stereo_rotation(left, right, sr):
+    angle_rad = STEREO_ROTATION_DEG * np.pi / 180
+    n = len(left)
+    t = np.linspace(0, angle_rad, n)
+    cos_t = np.cos(t)
+    sin_t = np.sin(t)
+    new_left = left * cos_t - right * sin_t
+    new_right = left * sin_t + right * cos_t
+    return new_left, new_right
+
+
+def process_audio_mono(audio, sr):
+    audio = nonuniform_time_warp(audio, sr)
+    audio = stft_constellation_poison(audio, sr)
+    audio = amplitude_wobble(audio, sr)
+    return audio
 
 
 def extract_audio(video_path, wav_path, sr, channels):
@@ -277,12 +475,25 @@ def process_audio(video_path, output_wav, info):
     samples, params = load_wav(tmp_wav)
 
     if samples.ndim == 1:
-        samples = constellation_poison_mono(samples, sr)
+        samples = process_audio_mono(samples, sr)
     else:
-        for c in range(samples.shape[1]):
-            samples[:, c] = constellation_poison_mono(samples[:, c], sr)
+        col0 = process_audio_mono(samples[:, 0], sr)
+        col1 = process_audio_mono(samples[:, 1], sr)
 
-    save_wav(str(output_wav), samples, params)
+        min_len = min(len(col0), len(col1))
+        col0 = col0[:min_len]
+        col1 = col1[:min_len]
+
+        col0, col1 = stereo_rotation(col0, col1, sr)
+
+        samples = np.column_stack([col0, col1])
+
+    new_params = wave._wave_params(
+        params.nchannels, params.sampwidth, params.framerate,
+        len(samples) if samples.ndim == 1 else samples.shape[0],
+        params.comptype, params.compname
+    )
+    save_wav(str(output_wav), samples, new_params)
 
     try:
         os.remove(tmp_wav)
@@ -293,7 +504,8 @@ def process_audio(video_path, output_wav, info):
 
 # ─── Output Naming ────────────────────────────────────────────────────
 
-def generate_output_name(output_dir):
+def generate_output_name(output_dir, seed):
+    rng = random.Random(seed)
     existing = set()
     for f in Path(output_dir).glob("IMG_*.mp4"):
         try:
@@ -302,22 +514,32 @@ def generate_output_name(output_dir):
         except (ValueError, IndexError):
             pass
     while True:
-        num = random.randint(1000, 9999)
+        num = rng.randint(1000, 9999)
         if num not in existing:
             return f"IMG_{num:04d}.mp4"
 
 
-def random_creation_time():
-    now = time.time()
-    offset = random.randint(86400, 86400 * 30)
-    t = now - offset
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t))
+def random_creation_time(seed):
+    rng = random.Random(seed + 1)
+    base = 1727400000
+    offset = rng.randint(0, 86400 * 60)
+    t = base - offset
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t))
 
 
 # ─── Main Pipeline ────────────────────────────────────────────────────
 
 def process_video(input_path, output_dir, info):
-    output_name = generate_output_name(output_dir)
+    global prev_frame, frame_buffer
+    prev_frame = None
+    frame_buffer = None
+
+    seed = compute_file_seed(input_path)
+    random.seed(seed)
+    np.random.seed(seed % (2**31))
+    print(f"  Seed: {seed} (deterministic)")
+
+    output_name = generate_output_name(output_dir, seed)
     output_path = os.path.join(output_dir, output_name)
 
     w = info["width"]
@@ -326,10 +548,8 @@ def process_video(input_path, output_dir, info):
     rotation = info["rotation"]
 
     disp_w, disp_h = get_display_dims(w, h, rotation)
-
     transpose = build_transpose_filter(rotation)
 
-    # decoder filters
     dec_filters = []
     if transpose:
         dec_filters.append(transpose)
@@ -349,24 +569,20 @@ def process_video(input_path, output_dir, info):
     frame_h = disp_h
     frame_size = frame_w * frame_h * 3
 
-    # crop dimensions
     crop_w = frame_w - 2 * CROP_PX
     crop_h = frame_h - 2 * CROP_PX
 
-    # process audio
     audio_wav = None
     if info["has_audio"]:
         audio_wav = os.path.join(output_dir, f".tmp_audio_{output_name}.wav")
-        print(f"  Processing audio...")
+        print(f"  Audio: STFT poison + non-uniform warp + stereo rotation + wobble")
         if not process_audio(input_path, audio_wav, info):
-            print(f"  Warning: audio processing failed, encoding without audio")
+            print(f"  Warning: audio processing failed")
             audio_wav = None
 
-    # encoder filters
     enc_vf = []
     enc_vf.append(f"crop={crop_w}:{crop_h}:{CROP_PX}:{CROP_PX}")
     enc_vf.append(f"scale={crop_w}:{crop_h}")
-    enc_vf.append(f"noise=c0s={NOISE_STRENGTH}:c0f=t")
     enc_vf.append(f"setpts=PTS/{SPEED}")
 
     new_fps = fps * SPEED
@@ -390,7 +606,7 @@ def process_video(input_path, output_dir, info):
             "-af", f"asetrate={audio_rate},aresample={info['audio_sr']}",
         ]
 
-    creation_time = random_creation_time()
+    creation_time = random_creation_time(seed)
     enc_cmd += [
         "-c:v", "libx264",
         "-crf", str(CRF),
@@ -403,6 +619,7 @@ def process_video(input_path, output_dir, info):
         "-metadata", "handler_name=Core Media Video",
         "-metadata:s:v", "handler_name=Core Media Video",
         "-map_metadata", "-1",
+        "-threads", "1",
     ]
 
     if audio_wav:
@@ -412,13 +629,22 @@ def process_video(input_path, output_dir, info):
 
     enc_cmd += ["-v", "error", str(output_path)]
 
-    print(f"  Starting decode/encode pipeline...")
+    total_frames = int(info["duration"] * fps) if info["duration"] > 0 else 0
+    print(f"  Video: warp({MESH_AMP}px) + perspective + DCT({DCT_STRENGTH}) + "
+          f"color({COLOR_SHIFT_DEG}°) + gamma + chroma + noise + zoom + gradient + dilute + blend + swap")
+    print(f"  Encoding...")
+
     decoder = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     encoder = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     frame_idx = 0
-    total_frames = int(info["duration"] * fps) if info["duration"] > 0 else 0
+    written = 0
     last_pct = -1
+
+    def write_frame(f):
+        nonlocal written
+        encoder.stdin.write(f.tobytes())
+        written += 1
 
     try:
         while True:
@@ -427,8 +653,16 @@ def process_video(input_path, output_dir, info):
                 break
 
             frame = np.frombuffer(raw, dtype=np.uint8).reshape((frame_h, frame_w, 3)).copy()
-            frame = process_frame(frame, frame_idx)
-            encoder.stdin.write(frame.tobytes())
+            result = process_frame(frame, frame_idx, total_frames)
+
+            if result is None:
+                pass
+            elif isinstance(result, tuple):
+                for f in result:
+                    write_frame(f)
+            else:
+                write_frame(result)
+
             frame_idx += 1
 
             if total_frames > 0:
@@ -440,6 +674,12 @@ def process_video(input_path, output_dir, info):
     except BrokenPipeError:
         pass
     finally:
+        if frame_buffer is not None:
+            try:
+                write_frame(frame_buffer)
+            except:
+                pass
+            frame_buffer = None
         try:
             encoder.stdin.close()
         except:
@@ -460,7 +700,7 @@ def process_video(input_path, output_dir, info):
         except OSError:
             pass
 
-    print(f"  Done! {frame_idx} frames processed → {output_name}")
+    print(f"  Done! {frame_idx} frames read, {written} written → {output_name}")
     return output_path
 
 
@@ -483,7 +723,9 @@ def main():
         print(f"Supported formats: {', '.join(sorted(SUPPORTED_EXT))}")
         return
 
-    print(f"Found {len(videos)} video(s) to process\n")
+    print(f"Found {len(videos)} video(s) to process")
+    print(f"v3 Hardened | warp={MESH_AMP}px dct={DCT_STRENGTH} crop={CROP_PX}px "
+          f"color={COLOR_SHIFT_DEG}° speed={SPEED}x blend={BLEND_ALPHA}\n")
 
     for i, vpath in enumerate(videos, 1):
         name = os.path.basename(vpath)
