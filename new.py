@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-TikTok Video Uniqualizer v3 — hardened version.
+TikTok Video Uniqualizer v4 — invisible to humans, unique for AI.
 Deterministic: same input = same output (seed from file hash).
 
-Breaks all 5 detection layers:
-  1. File hash — re-encode
-  2. Perceptual hash (TMK+PDQF 64x64@15fps) — heavy mesh warp + perspective
-  3. Audio fingerprint — non-uniform time warp + STFT poisoning + stereo rotation
-  4. Deep learning (CLIP/ViT) — gradient overlay + attention dilution + color shift
-  5. C2PA watermarks — aggressive DCT butterfly (above error-correction threshold)
+Strategy: heavy frequency-domain attacks (invisible) + gentle spatial (below JND).
+Fixes v3: removed per-frame flicker from color/gamma, removed visible perspective/gradient.
 """
 
 import os
@@ -26,25 +22,25 @@ import numpy as np
 import cv2
 
 # ─── Config ───────────────────────────────────────────────────────────
-SPEED = 1.03
-PITCH_FACTOR = 1.03
+SPEED = 1.015
+PITCH_FACTOR = 1.015
 CRF = 21
 PRESET = "medium"
-CROP_PX = 10
-MESH_GRID = 12
-MESH_AMP = 7.0
-DCT_STRENGTH = 0.25
-NOISE_STRENGTH = 5
-DILUTION_AMP = 7
-DILUTION_THRESHOLD = 20
-COLOR_SHIFT_DEG = 6
-GAMMA_SHIFT = 0.08
-ZOOM_DRIFT_MAX = 0.03
-BLEND_ALPHA = 0.10
-CHROMA_NOISE = 8
-PERSPECTIVE_AMP = 3.0
-GRADIENT_OPACITY = 0.035
+CROP_PX = 4
+MESH_GRID = 8
+MESH_AMP = 2.5
+DCT_STRENGTH = 0.35
+LUMA_NOISE = 2
+CHROMA_NOISE_AMP = 12
+DILUTION_AMP = 3
+DILUTION_THRESHOLD = 12
+COLOR_SHIFT_DEG = 2
+GAMMA_SHIFT_VAL = 0.03
+ZOOM_DRIFT_MAX = 0.008
+BLEND_ALPHA = 0.03
+SUBPIXEL_SHIFT = 0.4
 FRAME_SWAP_INTERVAL = 25
+TEMPORAL_JITTER_INTERVAL = 90
 AUDIO_PHANTOM_OFFSET_HZ = 75
 AUDIO_PHANTOM_AMP = 0.85
 AUDIO_WOBBLE_HZ = 3.5
@@ -155,20 +151,12 @@ def mesh_warp(frame):
                      cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
 
 
-def perspective_transform(frame):
+def subpixel_translate(frame):
     h, w = frame.shape[:2]
-    amp = PERSPECTIVE_AMP
-
-    src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-    dst = np.float32([
-        [np.random.uniform(0, amp), np.random.uniform(0, amp)],
-        [w - np.random.uniform(0, amp), np.random.uniform(0, amp)],
-        [w - np.random.uniform(0, amp), h - np.random.uniform(0, amp)],
-        [np.random.uniform(0, amp), h - np.random.uniform(0, amp)]
-    ])
-
-    M = cv2.getPerspectiveTransform(src, dst)
-    return cv2.warpPerspective(frame, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+    tx = np.random.uniform(-SUBPIXEL_SHIFT, SUBPIXEL_SHIFT)
+    ty = np.random.uniform(-SUBPIXEL_SHIFT, SUBPIXEL_SHIFT)
+    M = np.float32([[1, 0, tx], [0, 1, ty]])
+    return cv2.warpAffine(frame, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
 
 
 def dct_butterfly(frame):
@@ -186,36 +174,31 @@ def dct_butterfly(frame):
         mask = (magnitude > median_mag * 0.2) & (magnitude < median_mag * 5.0)
         dft[band_h, band_w] += perturbation * mask * median_mag
 
+    phase = np.angle(dft)
+    mid_h = slice(h // 4, 3 * h // 4)
+    mid_w = slice(w // 4, 3 * w // 4)
+    phase_rot = np.random.uniform(-0.15, 0.15, phase[mid_h, mid_w].shape)
+    dft[mid_h, mid_w] = np.abs(dft[mid_h, mid_w]) * np.exp(1j * (phase[mid_h, mid_w] + phase_rot))
+
     y_new = np.clip(np.fft.ifft2(dft).real, 0, 255).astype(np.uint8)
     yuv[:, :, 0] = y_new
     return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
 
 
-def color_shift(frame):
+def apply_static_color_gamma(frame, hue_shift, sat_factor, gamma_inv_table):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.int16)
-    shift = random.randint(-COLOR_SHIFT_DEG, COLOR_SHIFT_DEG)
-    hsv[:, :, 0] = (hsv[:, :, 0] + shift) % 180
-    sat_factor = random.uniform(0.94, 1.06)
+    hsv[:, :, 0] = (hsv[:, :, 0] + hue_shift) % 180
     hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_factor, 0, 255)
-    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
-
-def gamma_shift(frame):
-    shift = random.uniform(-GAMMA_SHIFT, GAMMA_SHIFT)
-    gamma = 1.0 + shift
-    inv_gamma = 1.0 / gamma
-    table = np.array([
-        np.clip(((i / 255.0) ** inv_gamma) * 255.0, 0, 255)
-        for i in range(256)
-    ], dtype=np.uint8)
-    return cv2.LUT(frame, table)
+    frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    frame = cv2.LUT(frame, gamma_inv_table)
+    return frame
 
 
 def chroma_noise(frame):
     yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
-    noise_u = np.random.randint(-CHROMA_NOISE, CHROMA_NOISE + 1,
+    noise_u = np.random.randint(-CHROMA_NOISE_AMP, CHROMA_NOISE_AMP + 1,
                                 yuv[:, :, 1].shape, dtype=np.int16)
-    noise_v = np.random.randint(-CHROMA_NOISE, CHROMA_NOISE + 1,
+    noise_v = np.random.randint(-CHROMA_NOISE_AMP, CHROMA_NOISE_AMP + 1,
                                 yuv[:, :, 2].shape, dtype=np.int16)
     yuv[:, :, 1] = np.clip(yuv[:, :, 1].astype(np.int16) + noise_u, 0, 255).astype(np.uint8)
     yuv[:, :, 2] = np.clip(yuv[:, :, 2].astype(np.int16) + noise_v, 0, 255).astype(np.uint8)
@@ -223,7 +206,7 @@ def chroma_noise(frame):
 
 
 def luma_noise(frame):
-    noise = np.random.randint(-NOISE_STRENGTH, NOISE_STRENGTH + 1,
+    noise = np.random.randint(-LUMA_NOISE, LUMA_NOISE + 1,
                               frame.shape, dtype=np.int16)
     return np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
@@ -242,38 +225,6 @@ def zoom_drift(frame, frame_idx, total_frames):
 
     cropped = frame[y1:y1 + new_h, x1:x1 + new_w]
     return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
-
-
-def gradient_overlay(frame, frame_idx, total_frames):
-    h, w = frame.shape[:2]
-    if total_frames <= 0:
-        total_frames = 300
-    t = frame_idx / total_frames
-
-    angle = t * 2 * math.pi * 0.7
-    cx = int(w * (0.5 + 0.4 * math.cos(angle)))
-    cy = int(h * (0.5 + 0.4 * math.sin(angle)))
-
-    Y, X = np.ogrid[:h, :w]
-    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2).astype(np.float32)
-    max_dist = math.sqrt(w * w + h * h)
-    gradient = (dist / max_dist * 255).astype(np.float32)
-
-    overlay = np.zeros((h, w, 3), dtype=np.float32)
-    r_tint = random.randint(200, 255) if frame_idx == 0 else gradient_overlay._tint[0]
-    g_tint = random.randint(180, 240) if frame_idx == 0 else gradient_overlay._tint[1]
-    b_tint = random.randint(160, 220) if frame_idx == 0 else gradient_overlay._tint[2]
-    if frame_idx == 0:
-        gradient_overlay._tint = (r_tint, g_tint, b_tint)
-
-    overlay[:, :, 0] = gradient * (b_tint / 255.0)
-    overlay[:, :, 1] = gradient * (g_tint / 255.0)
-    overlay[:, :, 2] = gradient * (r_tint / 255.0)
-
-    result = frame.astype(np.float32) * (1 - GRADIENT_OPACITY) + overlay * GRADIENT_OPACITY
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-gradient_overlay._tint = (230, 210, 190)
 
 
 def attention_dilution(frame):
@@ -296,42 +247,61 @@ def attention_dilution(frame):
     return result
 
 
-prev_frame = None
-frame_buffer = None
+class FrameProcessor:
+    def __init__(self, total_frames, seed):
+        self.total_frames = total_frames
+        self.prev_frame = None
+        self.frame_buffer = None
+        self.prev_for_jitter = None
 
-def process_frame(frame, frame_idx, total_frames):
-    global prev_frame, frame_buffer
+        rng = random.Random(seed + 100)
+        self.hue_shift = rng.randint(-COLOR_SHIFT_DEG, COLOR_SHIFT_DEG)
+        self.sat_factor = rng.uniform(0.97, 1.03)
+        gamma = 1.0 + rng.uniform(-GAMMA_SHIFT_VAL, GAMMA_SHIFT_VAL)
+        inv_gamma = 1.0 / gamma
+        self.gamma_table = np.array([
+            np.clip(((i / 255.0) ** inv_gamma) * 255.0, 0, 255)
+            for i in range(256)
+        ], dtype=np.uint8)
 
-    frame = mesh_warp(frame)
-    frame = perspective_transform(frame)
-    frame = dct_butterfly(frame)
-    frame = color_shift(frame)
-    frame = gamma_shift(frame)
-    frame = chroma_noise(frame)
-    frame = luma_noise(frame)
-    frame = zoom_drift(frame, frame_idx, total_frames)
-    frame = gradient_overlay(frame, frame_idx, total_frames)
-    frame = attention_dilution(frame)
+    def process(self, frame, frame_idx):
+        frame = mesh_warp(frame)
+        frame = subpixel_translate(frame)
+        frame = dct_butterfly(frame)
+        frame = apply_static_color_gamma(frame, self.hue_shift, self.sat_factor, self.gamma_table)
+        frame = chroma_noise(frame)
+        frame = luma_noise(frame)
+        frame = zoom_drift(frame, frame_idx, self.total_frames)
+        frame = attention_dilution(frame)
 
-    if prev_frame is not None and prev_frame.shape == frame.shape:
-        frame = cv2.addWeighted(frame, 1.0 - BLEND_ALPHA, prev_frame, BLEND_ALPHA, 0)
+        if self.prev_frame is not None and self.prev_frame.shape == frame.shape:
+            frame = cv2.addWeighted(frame, 1.0 - BLEND_ALPHA, self.prev_frame, BLEND_ALPHA, 0)
 
-    prev_frame = frame.copy()
+        self.prev_frame = frame.copy()
 
-    if frame_idx % FRAME_SWAP_INTERVAL == 0 and frame_buffer is not None:
-        out = frame_buffer
-        frame_buffer = frame
-        return out
-    elif frame_idx % FRAME_SWAP_INTERVAL == 0:
-        frame_buffer = frame
-        return None
-    elif frame_buffer is not None:
-        out = frame
-        buffered = frame_buffer
-        frame_buffer = None
-        return (buffered, out)
-    else:
-        return frame
+        if frame_idx > 0 and frame_idx % TEMPORAL_JITTER_INTERVAL == 0:
+            if self.prev_for_jitter is not None:
+                dup = self.prev_for_jitter
+                self.prev_for_jitter = frame.copy()
+                return ("jitter", dup, frame)
+            self.prev_for_jitter = frame.copy()
+            return frame
+
+        self.prev_for_jitter = frame.copy()
+
+        if frame_idx % FRAME_SWAP_INTERVAL == 0 and self.frame_buffer is not None:
+            out = self.frame_buffer
+            self.frame_buffer = frame
+            return out
+        elif frame_idx % FRAME_SWAP_INTERVAL == 0:
+            self.frame_buffer = frame
+            return None
+        elif self.frame_buffer is not None:
+            buffered = self.frame_buffer
+            self.frame_buffer = None
+            return ("pair", buffered, frame)
+        else:
+            return frame
 
 
 # ─── Audio Processing ─────────────────────────────────────────────────
@@ -352,10 +322,7 @@ def load_wav(path):
 
 
 def save_wav(path, samples, params):
-    if samples.ndim > 1:
-        flat = samples.flatten()
-    else:
-        flat = samples
+    flat = samples.flatten() if samples.ndim > 1 else samples
     if params.sampwidth == 2:
         flat = np.clip(flat, -32768, 32767).astype(np.int16)
     elif params.sampwidth == 4:
@@ -380,15 +347,10 @@ def nonuniform_time_warp(audio, sr):
         seg = audio[start:end]
 
         factor = np.random.uniform(AUDIO_WARP_RANGE[0], AUDIO_WARP_RANGE[1])
-        new_len = int(len(seg) / factor)
-        if new_len < 10:
-            segments.append(seg)
-            continue
-
+        new_len = max(10, int(len(seg) / factor))
         x_old = np.linspace(0, 1, len(seg))
         x_new = np.linspace(0, 1, new_len)
-        resampled = np.interp(x_new, x_old, seg)
-        segments.append(resampled)
+        segments.append(np.interp(x_new, x_old, seg))
 
     return np.concatenate(segments)
 
@@ -441,9 +403,7 @@ def stereo_rotation(left, right, sr):
     t = np.linspace(0, angle_rad, n)
     cos_t = np.cos(t)
     sin_t = np.sin(t)
-    new_left = left * cos_t - right * sin_t
-    new_right = left * sin_t + right * cos_t
-    return new_left, new_right
+    return left * cos_t - right * sin_t, left * sin_t + right * cos_t
 
 
 def process_audio_mono(audio, sr):
@@ -460,8 +420,7 @@ def extract_audio(video_path, wav_path, sr, channels):
         "-ar", str(sr), "-ac", str(channels),
         str(wav_path)
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.returncode == 0
+    return subprocess.run(cmd, capture_output=True, text=True).returncode == 0
 
 
 def process_audio(video_path, output_wav, info):
@@ -479,13 +438,9 @@ def process_audio(video_path, output_wav, info):
     else:
         col0 = process_audio_mono(samples[:, 0], sr)
         col1 = process_audio_mono(samples[:, 1], sr)
-
         min_len = min(len(col0), len(col1))
-        col0 = col0[:min_len]
-        col1 = col1[:min_len]
-
+        col0, col1 = col0[:min_len], col1[:min_len]
         col0, col1 = stereo_rotation(col0, col1, sr)
-
         samples = np.column_stack([col0, col1])
 
     new_params = wave._wave_params(
@@ -523,17 +478,12 @@ def random_creation_time(seed):
     rng = random.Random(seed + 1)
     base = 1727400000
     offset = rng.randint(0, 86400 * 60)
-    t = base - offset
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t))
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(base - offset))
 
 
 # ─── Main Pipeline ────────────────────────────────────────────────────
 
 def process_video(input_path, output_dir, info):
-    global prev_frame, frame_buffer
-    prev_frame = None
-    frame_buffer = None
-
     seed = compute_file_seed(input_path)
     random.seed(seed)
     np.random.seed(seed % (2**31))
@@ -554,36 +504,30 @@ def process_video(input_path, output_dir, info):
     if transpose:
         dec_filters.append(transpose)
 
-    dec_cmd = [
-        "ffmpeg", "-nostdin", "-noautorotate",
-        "-i", str(input_path),
-    ]
+    dec_cmd = ["ffmpeg", "-nostdin", "-noautorotate", "-i", str(input_path)]
     if dec_filters:
         dec_cmd += ["-vf", ",".join(dec_filters)]
-    dec_cmd += [
-        "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-v", "error", "pipe:1"
-    ]
+    dec_cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-v", "error", "pipe:1"]
 
     frame_w = disp_w
     frame_h = disp_h
     frame_size = frame_w * frame_h * 3
-
     crop_w = frame_w - 2 * CROP_PX
     crop_h = frame_h - 2 * CROP_PX
 
     audio_wav = None
     if info["has_audio"]:
         audio_wav = os.path.join(output_dir, f".tmp_audio_{output_name}.wav")
-        print(f"  Audio: STFT poison + non-uniform warp + stereo rotation + wobble")
+        print(f"  Audio: non-uniform warp + STFT poison + stereo rotation + wobble")
         if not process_audio(input_path, audio_wav, info):
             print(f"  Warning: audio processing failed")
             audio_wav = None
 
-    enc_vf = []
-    enc_vf.append(f"crop={crop_w}:{crop_h}:{CROP_PX}:{CROP_PX}")
-    enc_vf.append(f"scale={crop_w}:{crop_h}")
-    enc_vf.append(f"setpts=PTS/{SPEED}")
+    enc_vf = [
+        f"crop={crop_w}:{crop_h}:{CROP_PX}:{CROP_PX}",
+        f"scale={crop_w}:{crop_h}",
+        f"setpts=PTS/{SPEED}",
+    ]
 
     new_fps = fps * SPEED
     audio_rate = int(info["audio_sr"] * PITCH_FACTOR)
@@ -591,47 +535,37 @@ def process_video(input_path, output_dir, info):
     enc_cmd = [
         "ffmpeg", "-nostdin", "-y",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{frame_w}x{frame_h}",
-        "-r", f"{fps}",
+        "-s", f"{frame_w}x{frame_h}", "-r", f"{fps}",
         "-i", "pipe:0",
     ]
-
     if audio_wav:
         enc_cmd += ["-i", audio_wav]
 
     enc_cmd += ["-vf", ",".join(enc_vf)]
 
     if audio_wav:
-        enc_cmd += [
-            "-af", f"asetrate={audio_rate},aresample={info['audio_sr']}",
-        ]
+        enc_cmd += ["-af", f"asetrate={audio_rate},aresample={info['audio_sr']}"]
 
     creation_time = random_creation_time(seed)
     enc_cmd += [
-        "-c:v", "libx264",
-        "-crf", str(CRF),
-        "-preset", PRESET,
-        "-profile:v", "high",
-        "-pix_fmt", "yuv420p",
-        "-r", f"{new_fps:.4f}",
-        "-movflags", "+faststart",
+        "-c:v", "libx264", "-crf", str(CRF),
+        "-preset", PRESET, "-profile:v", "high", "-pix_fmt", "yuv420p",
+        "-r", f"{new_fps:.4f}", "-movflags", "+faststart",
         "-metadata", f"creation_time={creation_time}",
         "-metadata", "handler_name=Core Media Video",
         "-metadata:s:v", "handler_name=Core Media Video",
-        "-map_metadata", "-1",
-        "-threads", "1",
+        "-map_metadata", "-1", "-threads", "1",
     ]
-
     if audio_wav:
         enc_cmd += ["-c:a", "aac", "-b:a", "128k"]
     else:
         enc_cmd += ["-an"]
-
     enc_cmd += ["-v", "error", str(output_path)]
 
     total_frames = int(info["duration"] * fps) if info["duration"] > 0 else 0
-    print(f"  Video: warp({MESH_AMP}px) + perspective + DCT({DCT_STRENGTH}) + "
-          f"color({COLOR_SHIFT_DEG}°) + gamma + chroma + noise + zoom + gradient + dilute + blend + swap")
+    processor = FrameProcessor(total_frames, seed)
+
+    print(f"  Video: warp + subpixel + DCT + color + chroma + noise + zoom + dilute + blend + swap + jitter")
     print(f"  Encoding...")
 
     decoder = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -653,13 +587,17 @@ def process_video(input_path, output_dir, info):
                 break
 
             frame = np.frombuffer(raw, dtype=np.uint8).reshape((frame_h, frame_w, 3)).copy()
-            result = process_frame(frame, frame_idx, total_frames)
+            result = processor.process(frame, frame_idx)
 
             if result is None:
                 pass
             elif isinstance(result, tuple):
-                for f in result:
-                    write_frame(f)
+                if result[0] == "jitter":
+                    write_frame(result[1])
+                    write_frame(result[2])
+                elif result[0] == "pair":
+                    write_frame(result[1])
+                    write_frame(result[2])
             else:
                 write_frame(result)
 
@@ -674,12 +612,11 @@ def process_video(input_path, output_dir, info):
     except BrokenPipeError:
         pass
     finally:
-        if frame_buffer is not None:
+        if processor.frame_buffer is not None:
             try:
-                write_frame(frame_buffer)
+                write_frame(processor.frame_buffer)
             except:
                 pass
-            frame_buffer = None
         try:
             encoder.stdin.close()
         except:
@@ -724,8 +661,8 @@ def main():
         return
 
     print(f"Found {len(videos)} video(s) to process")
-    print(f"v3 Hardened | warp={MESH_AMP}px dct={DCT_STRENGTH} crop={CROP_PX}px "
-          f"color={COLOR_SHIFT_DEG}° speed={SPEED}x blend={BLEND_ALPHA}\n")
+    print(f"v4 Stealth | warp={MESH_AMP}px subpx={SUBPIXEL_SHIFT}px dct={DCT_STRENGTH} "
+          f"chroma=±{CHROMA_NOISE_AMP} crop={CROP_PX}px speed={SPEED}x\n")
 
     for i, vpath in enumerate(videos, 1):
         name = os.path.basename(vpath)
