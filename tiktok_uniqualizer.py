@@ -252,8 +252,7 @@ def parse_atoms(data, start=0, end=None):
 
         if atom_end > end:
             atom_end = end
-        if atom_end <= pos + 8:
-            # Degenerate atom -- skip remaining
+        if atom_end < pos + 8:
             break
 
         if atype in _CONTAINERS:
@@ -295,8 +294,22 @@ def _patch_hdlr(atom):
     return atom
 
 
+def _patch_vendor_id(atom):
+    """Zero out FFMP vendor_id in avc1/mp4a sample description atoms."""
+    if atom.data and len(atom.data) >= 4:
+        d = bytearray(atom.data)
+        ffmp = b"FFMP"
+        idx = 0
+        while idx <= len(d) - 4:
+            if d[idx:idx+4] == ffmp:
+                d[idx:idx+4] = b"\x00\x00\x00\x00"
+            idx += 1
+        atom.data = bytes(d)
+    return atom
+
+
 def _modify_atoms(atoms):
-    """Walk atom tree: fix ftyp, hdlr, remove encoder tags."""
+    """Walk atom tree: fix ftyp, hdlr, remove encoder tags, patch vendor_id."""
     out = []
     for atom in atoms:
         if atom.type == b"ftyp":
@@ -305,9 +318,10 @@ def _modify_atoms(atoms):
         if atom.type == b"hdlr":
             out.append(_patch_hdlr(atom))
             continue
-        # Remove encoder-tool atoms
-        if atom.type in (b"\xa9too", b"\xa9enc", b"\xa9swr"):
+        if atom.type in (b"\xa9too", b"\xa9enc", b"\xa9swr", b"\xa9nam"):
             continue
+        if atom.type in (b"avc1", b"mp4a", b"hvc1"):
+            atom = _patch_vendor_id(atom)
         if atom.children:
             atom.children = _modify_atoms(atom.children)
         out.append(atom)
@@ -489,6 +503,24 @@ def patch_mov_file(filepath, apple_date_str, utc_date_str):
     output.extend(mdat_atom.serialize())
     for a in post_mdat:
         output.extend(a.serialize())
+
+    # Binary scrub: remove ffmpeg fingerprints embedded inside stsd and other
+    # opaque atoms that the tree parser does not descend into.
+    ffmpeg_markers = [
+        (b"FFMP", b"\x00\x00\x00\x00"),
+        (b"Lavc libx264", b"\x00" * 12),
+        (b"Lavc libx265", b"\x00" * 12),
+        (b"Lavf", b"\x00\x00\x00\x00"),
+        (b"libavformat", b"\x00" * 11),
+    ]
+    for marker, replacement in ffmpeg_markers:
+        idx = 0
+        while True:
+            idx = output.find(marker, idx)
+            if idx == -1:
+                break
+            output[idx:idx + len(replacement)] = replacement
+            idx += len(replacement)
 
     with open(filepath, "wb") as f:
         f.write(output)
