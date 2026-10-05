@@ -39,10 +39,10 @@ FIXED_PROCESSING_SEED = 0xDEAD_BEEF
 
 # --- Mesh warp (cv2 spatial deformation) ---
 MESH_GRID = 24           # Control points per axis (8→16→20→24)
-MESH_AMP = 10.0          # Max pixel displacement (2.0→4.0→6.0→10.0)
+MESH_AMP = 7.0           # Max pixel displacement (was 10.0, backed off)
 
 # --- DCT butterfly (mid-frequency perturbation) ---
-DCT_STRENGTH = 0.40      # Perturbation amplitude (0.08→0.15→0.25→0.40)
+DCT_STRENGTH = 0.30      # Perturbation amplitude (was 0.40, backed off)
 
 # --- Attention dilution (texture in flat areas) ---
 DILUTION_AMP = 18        # Noise amplitude (4→8→12→18)
