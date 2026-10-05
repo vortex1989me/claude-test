@@ -32,29 +32,29 @@ PRESET = "slow"
 VIDEO_PROFILE = "high"
 VIDEO_LEVEL = "4.0"
 GOP_SIZE = 30
-SPEED_FACTOR = 1.03
+SPEED_FACTOR = 1.04
 
 # --- Fixed seed for identical processing across all videos ---
 FIXED_PROCESSING_SEED = 0xDEAD_BEEF
 
 # --- Mesh warp (cv2 spatial deformation) ---
-MESH_GRID = 20           # Control points per axis (was 8→16→20)
-MESH_AMP = 6.0           # Max pixel displacement (was 2.0→4.0→6.0)
+MESH_GRID = 24           # Control points per axis (8→16→20→24)
+MESH_AMP = 10.0          # Max pixel displacement (2.0→4.0→6.0→10.0)
 
 # --- DCT butterfly (mid-frequency perturbation) ---
-DCT_STRENGTH = 0.25      # Perturbation amplitude (was 0.08→0.15→0.25)
+DCT_STRENGTH = 0.40      # Perturbation amplitude (0.08→0.15→0.25→0.40)
 
 # --- Attention dilution (texture in flat areas) ---
-DILUTION_AMP = 12        # Noise amplitude (was 4→8→12)
-DILUTION_THRESHOLD = 25  # Flat-area std cutoff (was 12→18→25)
+DILUTION_AMP = 18        # Noise amplitude (4→8→12→18)
+DILUTION_THRESHOLD = 35  # Flat-area std cutoff (12→18→25→35)
 DILUTION_BLOCK = 16      # Block size for uniformity check
 
 # --- Audio constellation poisoning ---
 AUDIO_SAMPLE_RATE = 48000
 AUDIO_BITRATE = "192k"
-AUDIO_PHANTOM_OFFSET_HZ = 180   # Phantom peak offset Hz (was 75→120→180)
-AUDIO_PHANTOM_AMP = 1.0         # Phantom peak amplitude (was 0.80→0.95→1.0)
-AUDIO_PHANTOM_PEAKS_MULT = 12   # Peaks per second of audio (was 3→8→12)
+AUDIO_PHANTOM_OFFSET_HZ = 250   # Phantom peak offset Hz (75→120→180→250)
+AUDIO_PHANTOM_AMP = 1.2         # Phantom peak amplitude (0.80→0.95→1.0→1.2)
+AUDIO_PHANTOM_PEAKS_MULT = 20   # Peaks per second of audio (3→8→12→20)
 
 # --- iPhone device metadata ---
 DEVICE_MAKE = "Apple"
