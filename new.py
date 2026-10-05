@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-TikTok Video Uniqualizer v7
+TikTok Video Uniqualizer v8
 ============================
-Processes TikTok-downloaded videos to appear as unique iPhone-recorded content.
+Structural modification approach to bypass content-level detection.
 
 Processing pipeline:
   - HFLIP (horizontal mirror)
-  - Mesh warp (cv2 spatial deformation on grid)
-  - DCT butterfly (mid-frequency perturbation in YUV domain)
-  - Attention dilution (texture injection in uniform areas)
-  - Constellation poisoning (phantom audio frequency peaks)
+  - Asymmetric crop 12-15% + scale back (changes PDQ hash composition)
+  - Ken Burns virtual camera (zoom + pan, breaks TMK+PDQF temporal hash)
+  - Scene shuffling + cross-fade transitions (breaks temporal fingerprint)
   - iPhone metadata spoofing (QuickTime container, Apple metadata, bt709 color)
   - Binary MOV patching (ftyp, hdlr, stco/co64, ffmpeg marker scrub)
 """
@@ -34,27 +33,33 @@ VIDEO_LEVEL = "4.0"
 GOP_SIZE = 30
 SPEED_FACTOR = 1.04
 
-# --- Fixed seed for identical processing across all videos ---
+# --- Fixed seed for deterministic processing ---
 FIXED_PROCESSING_SEED = 0xDEAD_BEEF
 
-# --- Mesh warp (cv2 spatial deformation) ---
-MESH_GRID = 24           # Control points per axis (8→16→20→24)
-MESH_AMP = 7.0           # Max pixel displacement (was 10.0, backed off)
+# --- Asymmetric crop (changes PDQ hash composition) ---
+CROP_LEFT = 0.15      # 15% from left
+CROP_RIGHT = 0.10     # 10% from right
+CROP_TOP = 0.12       # 12% from top
+CROP_BOTTOM = 0.08    # 8% from bottom
 
-# --- DCT butterfly (mid-frequency perturbation) ---
-DCT_STRENGTH = 0.30      # Perturbation amplitude (was 0.40, backed off)
+# --- Ken Burns virtual camera (slow zoom + pan) ---
+KB_ZOOM_START = 1.05   # 5% zoom at video start
+KB_ZOOM_END = 1.12     # 12% zoom at video end
+KB_PAN_X_START = 0.30  # pan start X (fraction of max offset)
+KB_PAN_X_END = 0.70    # pan end X
+KB_PAN_Y_START = 0.25  # pan start Y
+KB_PAN_Y_END = 0.75    # pan end Y
 
-# --- Attention dilution (texture in flat areas) ---
-DILUTION_AMP = 18        # Noise amplitude (4→8→12→18)
-DILUTION_THRESHOLD = 35  # Flat-area std cutoff (12→18→25→35)
-DILUTION_BLOCK = 16      # Block size for uniformity check
+# --- Scene shuffling ---
+SCENE_THRESHOLD = 0.35     # histogram L1 diff for scene boundary
+MIN_SCENE_FRAMES = 15      # minimum frames per scene segment
+MIN_SEGMENTS = 3           # force-split if fewer scenes detected
+FALLBACK_CHUNK_SEC = 3.0   # chunk size when force-splitting
+TRANSITION_SEC = 0.4       # cross-fade duration between shuffled scenes
 
-# --- Audio constellation poisoning ---
+# --- Audio ---
 AUDIO_SAMPLE_RATE = 48000
 AUDIO_BITRATE = "192k"
-AUDIO_PHANTOM_OFFSET_HZ = 250   # Phantom peak offset Hz (75→120→180→250)
-AUDIO_PHANTOM_AMP = 1.2         # Phantom peak amplitude (0.80→0.95→1.0→1.2)
-AUDIO_PHANTOM_PEAKS_MULT = 20   # Peaks per second of audio (3→8→12→20)
 
 # --- iPhone device metadata ---
 DEVICE_MAKE = "Apple"
@@ -583,182 +588,142 @@ def _write_wav(filepath, data, sample_rate, channels=2):
         f.write(data.astype(np.int16).tobytes())
 
 
-def _constellation_poison_mono(samples, sr, rng):
-    """Inject phantom frequency peaks near the strongest spectral peaks."""
-    n = len(samples)
-    spectrum = np.fft.rfft(samples)
-    freqs = np.fft.rfftfreq(n, 1.0 / sr)
-
-    n_peaks = max(10, n // sr * AUDIO_PHANTOM_PEAKS_MULT)
-    peak_indices = np.argsort(np.abs(spectrum))[-n_peaks:]
-
-    for idx in peak_indices:
-        if idx < len(freqs):
-            freq = freqs[idx]
-            for target_f in [freq + AUDIO_PHANTOM_OFFSET_HZ,
-                             freq - AUDIO_PHANTOM_OFFSET_HZ]:
-                if 20 < target_f < sr / 2:
-                    target_idx = int(target_f * n / sr)
-                    if 0 < target_idx < len(spectrum):
-                        phase = rng.uniform(0, 2 * np.pi)
-                        spectrum[target_idx] += (
-                            np.abs(spectrum[idx]) * AUDIO_PHANTOM_AMP
-                            * np.exp(1j * phase)
-                        )
-
-    return np.fft.irfft(spectrum, n=n)
-
-
-def process_audio(input_wav, output_wav, rng):
-    """Constellation poisoning + speed change."""
-    log("  Processing audio...")
-    data, sr, channels = _read_wav(input_wav)
-
+def _speed_change_audio(data, sr, channels):
+    if SPEED_FACTOR == 1.0:
+        return data
     fdata = data.astype(np.float64) / 32768.0
-
-    if channels > 1 and fdata.ndim == 2:
+    old_len = fdata.shape[0]
+    new_len = int(old_len / SPEED_FACTOR)
+    old_x = np.linspace(0, 1, old_len)
+    new_x = np.linspace(0, 1, new_len)
+    if fdata.ndim == 2:
+        new_data = np.zeros((new_len, channels), dtype=np.float64)
         for ch in range(channels):
-            ch_rng = np.random.default_rng(int(rng.integers(0, 2**31)) + ch)
-            fdata[:, ch] = _constellation_poison_mono(fdata[:, ch], sr, ch_rng)
+            new_data[:, ch] = np.interp(new_x, old_x, fdata[:, ch])
+        fdata = new_data
     else:
-        fdata = _constellation_poison_mono(fdata.ravel(), sr, rng)
-
-    if SPEED_FACTOR != 1.0:
-        old_len = fdata.shape[0]
-        new_len = int(old_len / SPEED_FACTOR)
-        old_x = np.linspace(0, 1, old_len)
-        new_x = np.linspace(0, 1, new_len)
-        if fdata.ndim == 2:
-            new_data = np.zeros((new_len, channels), dtype=np.float64)
-            for ch in range(channels):
-                new_data[:, ch] = np.interp(new_x, old_x, fdata[:, ch])
-            fdata = new_data
-        else:
-            fdata = np.interp(new_x, old_x, fdata)
-
+        fdata = np.interp(new_x, old_x, fdata)
     fdata = np.clip(fdata, -1.0, 1.0)
-    int_data = (fdata * 32767).astype(np.int16)
-    _write_wav(output_wav, int_data, sr, channels)
-    log("    Audio done")
+    return (fdata * 32767).astype(np.int16)
 
 
 # ============================================================
-# VIDEO FRAME PROCESSOR
+# FRAME PROCESSING (structural transforms)
 # ============================================================
 
-class FrameProcessor:
-    """
-    Per-frame video processing with cv2-based spatial and frequency filters.
 
-    Precomputes mesh warp displacement maps once. DCT and attention dilution
-    use fixed-seed RNGs for determinism.
-    """
+def process_frame(frame, frame_idx, total_frames, display_w, display_h):
+    """HFLIP + asymmetric crop + Ken Burns zoom/pan + resize."""
+    h, w = frame.shape[:2]
 
-    def __init__(self, width, height, rng):
-        self.w = width
-        self.h = height
-        self._precompute_mesh(rng)
-        self.dct_seed = int(rng.integers(0, 2**31))
-        self.dilution_seed = int(rng.integers(0, 2**31))
+    # 1. Horizontal flip
+    if HFLIP:
+        frame = np.ascontiguousarray(frame[:, ::-1, :])
 
-    def _precompute_mesh(self, rng):
-        h, w = self.h, self.w
-        dx = rng.uniform(
-            -MESH_AMP, MESH_AMP, (MESH_GRID + 1, MESH_GRID + 1)
-        ).astype(np.float32)
-        dy = rng.uniform(
-            -MESH_AMP, MESH_AMP, (MESH_GRID + 1, MESH_GRID + 1)
-        ).astype(np.float32)
-        dx[0, :] = dx[-1, :] = dx[:, 0] = dx[:, -1] = 0
-        dy[0, :] = dy[-1, :] = dy[:, 0] = dy[:, -1] = 0
+    # 2. Asymmetric crop
+    x1 = int(w * CROP_LEFT)
+    x2 = int(w * (1 - CROP_RIGHT))
+    y1 = int(h * CROP_TOP)
+    y2 = int(h * (1 - CROP_BOTTOM))
+    frame = frame[y1:y2, x1:x2]
 
-        full_dx = cv2.resize(dx, (w, h), interpolation=cv2.INTER_LINEAR)
-        full_dy = cv2.resize(dy, (w, h), interpolation=cv2.INTER_LINEAR)
+    # 3. Ken Burns (zoom + pan interpolated over video duration)
+    ch, cw = frame.shape[:2]
+    t = frame_idx / max(total_frames - 1, 1)
 
-        base_x = np.broadcast_to(
-            np.arange(w, dtype=np.float32)[np.newaxis, :], (h, w)
-        ).copy()
-        base_y = np.broadcast_to(
-            np.arange(h, dtype=np.float32)[:, np.newaxis], (h, w)
-        ).copy()
+    zoom = KB_ZOOM_START + (KB_ZOOM_END - KB_ZOOM_START) * t
+    crop_w = int(cw / zoom)
+    crop_h = int(ch / zoom)
 
-        self.map_x = base_x + full_dx
-        self.map_y = base_y + full_dy
+    max_dx = cw - crop_w
+    max_dy = ch - crop_h
+    pan_x = KB_PAN_X_START + (KB_PAN_X_END - KB_PAN_X_START) * t
+    pan_y = KB_PAN_Y_START + (KB_PAN_Y_END - KB_PAN_Y_START) * t
+    cx = int(max_dx * pan_x) if max_dx > 0 else 0
+    cy = int(max_dy * pan_y) if max_dy > 0 else 0
 
-    def process(self, frame, frame_idx):
-        """
-        Process a single BGR uint8 frame.
+    frame = frame[cy:cy + crop_h, cx:cx + crop_w]
 
-        1. Horizontal flip
-        2. Mesh warp (precomputed displacement)
-        3. DCT butterfly (mid-frequency perturbation)
-        4. Attention dilution (texture in uniform areas)
-        """
-        # 1. HFLIP
-        if HFLIP:
-            frame = np.ascontiguousarray(frame[:, ::-1, :])
+    # 4. Resize to target dimensions
+    frame = cv2.resize(frame, (display_w, display_h),
+                       interpolation=cv2.INTER_LANCZOS4)
 
-        # 2. Mesh warp
-        frame = cv2.remap(
-            frame, self.map_x, self.map_y,
-            cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101,
-        )
+    return frame
 
-        # 3. DCT butterfly
-        yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
-        y_ch = yuv[:, :, 0].astype(np.float32)
-        dft = np.fft.fft2(y_ch)
-        fh, fw = y_ch.shape
-        mid_h = slice(fh // 4, 3 * fh // 4)
-        mid_w = slice(fw // 4, 3 * fw // 4)
 
-        dct_rng = np.random.default_rng(self.dct_seed)
-        perturbation = dct_rng.normal(0, DCT_STRENGTH, dft[mid_h, mid_w].shape)
-        magnitude = np.abs(dft[mid_h, mid_w])
-        median_mag = (
-            float(np.median(magnitude[magnitude > 0]))
-            if np.any(magnitude > 0) else 1.0
-        )
-        mask = (magnitude > median_mag * 0.5) & (magnitude < median_mag * 2.0)
-        dft[mid_h, mid_w] += perturbation * mask * median_mag
+def compute_histogram(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
+    total = hist.sum()
+    if total > 0:
+        hist /= total
+    return hist.flatten()
 
-        y_new = np.fft.ifft2(dft).real
-        yuv[:, :, 0] = np.clip(y_new, 0, 255).astype(np.uint8)
-        frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
 
-        # 4. Attention dilution (vectorized)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gh, gw = gray.shape
-        block = DILUTION_BLOCK
-        th = (gh // block) * block
-        tw = (gw // block) * block
+# ============================================================
+# SCENE DETECTION + SHUFFLING
+# ============================================================
 
-        if th > 0 and tw > 0:
-            n_by = th // block
-            n_bx = tw // block
-            gray_blocks = (
-                gray[:th, :tw]
-                .reshape(n_by, block, n_bx, block)
-                .transpose(0, 2, 1, 3)
-            )
-            stds = gray_blocks.astype(np.float32).std(axis=(2, 3))
-            uniform_mask = stds < DILUTION_THRESHOLD
 
-            if np.any(uniform_mask):
-                dil_rng = np.random.default_rng(self.dilution_seed)
-                noise = dil_rng.integers(
-                    -DILUTION_AMP, DILUTION_AMP + 1,
-                    (th, tw, 3), dtype=np.int16,
-                )
-                pixel_mask = np.repeat(
-                    np.repeat(uniform_mask, block, axis=0),
-                    block, axis=1,
-                )
-                region = frame[:th, :tw].astype(np.int16)
-                region += noise * pixel_mask[:, :, np.newaxis]
-                frame[:th, :tw] = np.clip(region, 0, 255).astype(np.uint8)
+def detect_scenes(histograms, fps):
+    n = len(histograms)
+    if n == 0:
+        return [(0, 0)]
 
-        return frame
+    boundaries = [0]
+    for i in range(1, n):
+        diff = np.sum(np.abs(histograms[i] - histograms[i - 1]))
+        if diff > SCENE_THRESHOLD and (i - boundaries[-1]) >= MIN_SCENE_FRAMES:
+            boundaries.append(i)
+    boundaries.append(n)
+
+    segments = [(boundaries[i], boundaries[i + 1])
+                for i in range(len(boundaries) - 1)]
+
+    if len(segments) < MIN_SEGMENTS:
+        chunk = max(MIN_SCENE_FRAMES, int(FALLBACK_CHUNK_SEC * fps))
+        segments = []
+        pos = 0
+        while pos < n:
+            end = min(pos + chunk, n)
+            if n - end < MIN_SCENE_FRAMES and end < n:
+                end = n
+            segments.append((pos, end))
+            pos = end
+
+    return segments
+
+
+def shuffle_audio_segments(audio_int, original_segments, shuffle_order,
+                           out_fps, sr, transition_sec):
+    total_audio = audio_int.shape[0]
+
+    audio_segs = []
+    for start_f, end_f in original_segments:
+        s0 = min(int(start_f * sr / out_fps), total_audio)
+        s1 = min(int(end_f * sr / out_fps), total_audio)
+        audio_segs.append(audio_int[s0:s1])
+
+    shuffled = [audio_segs[i] for i in shuffle_order]
+
+    transition_samples = int(transition_sec * sr)
+    parts = []
+    for i, seg in enumerate(shuffled):
+        parts.append(seg)
+        if i < len(shuffled) - 1 and transition_samples > 0:
+            tail_len = min(transition_samples, len(seg))
+            head_len = min(transition_samples, len(shuffled[i + 1]))
+            fade_len = min(tail_len, head_len)
+            if fade_len > 0:
+                tail = seg[-fade_len:].astype(np.float64)
+                head = shuffled[i + 1][:fade_len].astype(np.float64)
+                alpha = np.linspace(0, 1, fade_len)
+                if tail.ndim == 2:
+                    alpha = alpha[:, np.newaxis]
+                xfade = (tail * (1 - alpha) + head * alpha).astype(np.int16)
+                parts.append(xfade)
+
+    return np.concatenate(parts)
 
 
 # ============================================================
@@ -800,7 +765,6 @@ def process_video(input_path, output_path):
         display_w, display_h = coded_h, coded_w
     else:
         display_w, display_h = coded_w, coded_h
-
     display_w = display_w // 2 * 2
     display_h = display_h // 2 * 2
 
@@ -816,10 +780,7 @@ def process_video(input_path, output_path):
             pass
     if duration <= 0:
         nb = int(v_stream.get("nb_frames", 0))
-        if nb > 0:
-            duration = nb / fps
-        else:
-            duration = 30.0
+        duration = nb / fps if nb > 0 else 30.0
     total_frames = int(duration * fps)
 
     out_fps = fps * SPEED_FACTOR
@@ -843,11 +804,10 @@ def process_video(input_path, output_path):
     has_audio = a_stream is not None
     if has_audio:
         has_audio = _extract_audio(input_path, temp_audio_in)
-        if has_audio:
-            audio_rng = np.random.default_rng(FIXED_PROCESSING_SEED + 1)
-            process_audio(temp_audio_in, temp_audio_out, audio_rng)
 
-    # --- DECODE command ---
+    # ---- PHASE 1: Decode + transform + scene detection ----
+    log("  Phase 1: Decode, transform, detect scenes...")
+
     decode_vf = []
     if rotation in (90, -270):
         decode_vf.append("transpose=2")
@@ -866,7 +826,90 @@ def process_video(input_path, output_path):
         "pipe:1",
     ]
 
-    # --- ENCODE command ---
+    frame_size = display_w * display_h * 3
+    decode_proc = subprocess.Popen(
+        decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+
+    frame_data = []
+    histograms = []
+    progress_step = max(1, total_frames // 10)
+    frame_idx = 0
+
+    while True:
+        raw = decode_proc.stdout.read(frame_size)
+        if len(raw) < frame_size:
+            break
+        frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+            display_h, display_w, 3
+        )
+        processed = process_frame(
+            frame, frame_idx, total_frames, display_w, display_h
+        )
+
+        _, buf = cv2.imencode(
+            ".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, 97]
+        )
+        frame_data.append(buf.tobytes())
+
+        histograms.append(compute_histogram(processed))
+
+        frame_idx += 1
+        if frame_idx % progress_step == 0:
+            pct = int(frame_idx / total_frames * 100)
+            log(f"    Decode: {pct}%")
+
+    decode_proc.wait(timeout=30)
+    actual_frames = len(frame_data)
+    log(f"    Decoded {actual_frames} frames "
+        f"(~{sum(len(f) for f in frame_data) / 1048576:.0f} MB compressed)")
+
+    if actual_frames == 0:
+        log("  ERROR: no frames decoded")
+        return False
+
+    # ---- PHASE 2: Scene detection + shuffle ----
+    log("  Phase 2: Scene detection + shuffle...")
+
+    original_segments = detect_scenes(histograms, fps)
+    log(f"    Detected {len(original_segments)} segments")
+
+    shuffle_order = list(range(len(original_segments)))
+    if len(shuffle_order) > 1:
+        rng.shuffle(shuffle_order)
+    shuffled_segments = [original_segments[i] for i in shuffle_order]
+
+    transition_frames = int(TRANSITION_SEC * out_fps)
+    num_transitions = max(0, len(shuffled_segments) - 1)
+    total_output_frames = (
+        sum(e - s for s, e in shuffled_segments)
+        + num_transitions * transition_frames
+    )
+
+    for i, (s, e) in enumerate(shuffled_segments):
+        orig_idx = shuffle_order[i]
+        log(f"    [{i}] orig#{orig_idx} frames [{s}:{e}] ({e - s} fr)")
+    log(f"    Transitions: {num_transitions} x {transition_frames}fr "
+        f"({TRANSITION_SEC}s)")
+    log(f"    Total output: {total_output_frames} frames")
+
+    # ---- PHASE 2b: Audio ----
+    if has_audio:
+        log("  Processing audio...")
+        audio_data, sr, channels = _read_wav(temp_audio_in)
+        audio_int = _speed_change_audio(audio_data, sr, channels)
+
+        audio_shuffled = shuffle_audio_segments(
+            audio_int, original_segments, shuffle_order,
+            out_fps, sr, TRANSITION_SEC,
+        )
+        _write_wav(temp_audio_out, audio_shuffled, sr, channels)
+        log(f"    Audio: {audio_int.shape[0]} -> {audio_shuffled.shape[0]} "
+            f"samples")
+
+    # ---- PHASE 3: Encode ----
+    log("  Phase 3: Encode...")
+
     encode_cmd = [
         "ffmpeg", "-y", "-nostdin",
         "-f", "rawvideo",
@@ -878,7 +921,8 @@ def process_video(input_path, output_path):
     if has_audio:
         encode_cmd.extend(["-i", temp_audio_out])
 
-    encode_vf = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
+    encode_vf = ("setparams=color_primaries=bt709:color_trc=bt709"
+                 ":colorspace=bt709:range=tv")
 
     encode_cmd.extend([
         "-c:v", "libx264",
@@ -924,18 +968,6 @@ def process_video(input_path, output_path):
         output_path,
     ])
 
-    # --- Frame processor ---
-    frame_proc = FrameProcessor(display_w, display_h, rng)
-
-    # --- Pipeline ---
-    log("  Starting pipe-based encode...")
-    frame_size = display_w * display_h * 3
-
-    decode_proc = subprocess.Popen(
-        decode_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
     encode_proc = subprocess.Popen(
         encode_cmd,
         stdin=subprocess.PIPE,
@@ -955,37 +987,51 @@ def process_video(input_path, output_path):
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
     stderr_thread.start()
 
-    progress_step = max(1, total_frames // 10)
-    frame_idx = 0
+    frame_count = 0
     try:
-        while True:
-            raw = decode_proc.stdout.read(frame_size)
-            if len(raw) < frame_size:
-                break
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(
-                display_h, display_w, 3
-            )
-            processed = frame_proc.process(frame, frame_idx)
-            encode_proc.stdin.write(processed.tobytes())
-            frame_idx += 1
-            if frame_idx % progress_step == 0:
-                pct = int(frame_idx / total_frames * 100)
-                log(f"    Progress: {pct}%")
+        for seg_idx, (start, end) in enumerate(shuffled_segments):
+            for fidx in range(start, end):
+                frame = cv2.imdecode(
+                    np.frombuffer(frame_data[fidx], np.uint8),
+                    cv2.IMREAD_COLOR,
+                )
+                encode_proc.stdin.write(frame.tobytes())
+                frame_count += 1
+
+            if seg_idx < len(shuffled_segments) - 1 and transition_frames > 0:
+                last_frame = cv2.imdecode(
+                    np.frombuffer(frame_data[end - 1], np.uint8),
+                    cv2.IMREAD_COLOR,
+                ).astype(np.float32)
+                next_start = shuffled_segments[seg_idx + 1][0]
+                first_frame = cv2.imdecode(
+                    np.frombuffer(frame_data[next_start], np.uint8),
+                    cv2.IMREAD_COLOR,
+                ).astype(np.float32)
+
+                for t in range(transition_frames):
+                    alpha = (t + 1) / (transition_frames + 1)
+                    blended = (
+                        last_frame * (1 - alpha) + first_frame * alpha
+                    ).astype(np.uint8)
+                    encode_proc.stdin.write(blended.tobytes())
+                    frame_count += 1
+
+            log(f"    Segment {seg_idx + 1}/{len(shuffled_segments)} done")
 
         encode_proc.stdin.close()
         encode_proc.wait(timeout=300)
         stderr_thread.join(timeout=10)
-        decode_proc.wait(timeout=30)
 
     except Exception as exc:
-        decode_proc.kill()
         encode_proc.kill()
-        raise RuntimeError(f"Pipe error: {exc}") from exc
+        raise RuntimeError(f"Encode pipe error: {exc}") from exc
 
-    log(f"  Encoded {frame_idx} frames")
+    log(f"  Encoded {frame_count} frames")
 
     if encode_proc.returncode != 0:
-        err_msg = b"".join(enc_stderr_chunks).decode("utf-8", errors="replace")[:500]
+        err_msg = (b"".join(enc_stderr_chunks)
+                   .decode("utf-8", errors="replace")[:500])
         log(f"  ENCODE FAILED: {err_msg}")
         return False
 
@@ -993,6 +1039,8 @@ def process_video(input_path, output_path):
     patch_mov_file(output_path, apple_date, utc_date)
 
     # --- Cleanup ---
+    del frame_data
+    del histograms
     for tmp in (temp_audio_in, temp_audio_out):
         if os.path.isfile(tmp):
             os.remove(tmp)
@@ -1015,29 +1063,28 @@ def process_video(input_path, output_path):
 
 
 def verify_metadata(filepath):
-    """Comprehensive metadata check with indicators."""
     info = get_video_info(filepath)
     tags = info.get("format", {}).get("tags", {})
 
     log("")
     log("  " + "=" * 56)
-    log(f"  ПРОВЕРКА МЕТАДАННЫХ: {os.path.basename(filepath)}")
+    log(f"  METADATA CHECK: {os.path.basename(filepath)}")
     log("  " + "=" * 56)
 
-    make = tags.get("com.apple.quicktime.make", "НЕТ")
-    model = tags.get("com.apple.quicktime.model", "НЕТ")
-    sw = tags.get("com.apple.quicktime.software", "НЕТ")
-    log(f"    Производитель:     {make}")
-    log(f"    Модель:            {model}")
+    make = tags.get("com.apple.quicktime.make", "NONE")
+    model = tags.get("com.apple.quicktime.model", "NONE")
+    sw = tags.get("com.apple.quicktime.software", "NONE")
+    log(f"    Make:              {make}")
+    log(f"    Model:             {model}")
     log(f"    iOS:               {sw}")
 
-    cdate = tags.get("com.apple.quicktime.creationdate", "НЕТ")
-    ctime = tags.get("creation_time", "НЕТ")
-    log(f"    Дата записи:       {cdate}")
+    cdate = tags.get("com.apple.quicktime.creationdate", "NONE")
+    ctime = tags.get("creation_time", "NONE")
+    log(f"    Creation date:     {cdate}")
     log(f"    UTC:               {ctime}")
 
-    brand = tags.get("major_brand", "НЕТ").strip()
-    compat = tags.get("compatible_brands", "НЕТ").strip()
+    brand = tags.get("major_brand", "NONE").strip()
+    compat = tags.get("compatible_brands", "NONE").strip()
     ok_brand = "qt" in brand
     ok_compat = "qt" in compat
     log(f"    major_brand:       {brand}  {'OK' if ok_brand else 'FAIL'}")
@@ -1049,30 +1096,39 @@ def verify_metadata(filepath):
         st = s.get("codec_type")
 
         if st == "video":
-            log(f"    --- Видео ---")
-            log(f"    Кодек:             {s.get('codec_name', '?')} {s.get('profile', '')}")
-            log(f"    Разрешение:        {s.get('width', '?')}x{s.get('height', '?')}")
+            log(f"    --- Video ---")
+            log(f"    Codec:             {s.get('codec_name', '?')} "
+                f"{s.get('profile', '')}")
+            log(f"    Resolution:        {s.get('width', '?')}x"
+                f"{s.get('height', '?')}")
             log(f"    FPS:               {s.get('r_frame_rate', '?')}")
-            log(f"    Пиксели:           {s.get('pix_fmt', '?')}")
+            log(f"    Pix fmt:           {s.get('pix_fmt', '?')}")
 
-            cs = s.get("color_space", "НЕТ")
-            ct = s.get("color_transfer", "НЕТ")
-            cp = s.get("color_primaries", "НЕТ")
-            cr = s.get("color_range", "НЕТ")
-            log(f"    color_space:       {cs}  {'OK' if cs == 'bt709' else 'FAIL'}")
-            log(f"    color_transfer:    {ct}  {'OK' if ct == 'bt709' else 'FAIL'}")
-            log(f"    color_primaries:   {cp}  {'OK' if cp == 'bt709' else 'FAIL'}")
-            log(f"    color_range:       {cr}  {'OK' if cr == 'tv' else 'FAIL'}")
+            cs = s.get("color_space", "NONE")
+            ct = s.get("color_transfer", "NONE")
+            cp = s.get("color_primaries", "NONE")
+            cr = s.get("color_range", "NONE")
+            log(f"    color_space:       {cs}  "
+                f"{'OK' if cs == 'bt709' else 'FAIL'}")
+            log(f"    color_transfer:    {ct}  "
+                f"{'OK' if ct == 'bt709' else 'FAIL'}")
+            log(f"    color_primaries:   {cp}  "
+                f"{'OK' if cp == 'bt709' else 'FAIL'}")
+            log(f"    color_range:       {cr}  "
+                f"{'OK' if cr == 'tv' else 'FAIL'}")
 
-            hn = stags.get("handler_name", "НЕТ")
-            vid = stags.get("vendor_id", "НЕТ")
-            enc = stags.get("encoder", "НЕТ")
+            hn = stags.get("handler_name", "NONE")
+            vid = stags.get("vendor_id", "NONE")
+            enc = stags.get("encoder", "NONE")
             ok_hn = "Core Media" in hn
-            ok_vid = vid in ("[0][0][0][0]", "НЕТ")
-            ok_enc = enc in ("H.264", "НЕТ")
-            log(f"    handler_name:      {hn}  {'OK' if ok_hn else 'FAIL'}")
-            log(f"    vendor_id:         {vid}  {'OK' if ok_vid else 'FAIL'}")
-            log(f"    encoder:           {enc}  {'OK' if ok_enc else 'FAIL'}")
+            ok_vid = vid in ("[0][0][0][0]", "NONE")
+            ok_enc = enc in ("H.264", "NONE")
+            log(f"    handler_name:      {hn}  "
+                f"{'OK' if ok_hn else 'FAIL'}")
+            log(f"    vendor_id:         {vid}  "
+                f"{'OK' if ok_vid else 'FAIL'}")
+            log(f"    encoder:           {enc}  "
+                f"{'OK' if ok_enc else 'FAIL'}")
 
             if not ok_hn:
                 problems.append(f"video handler={hn}")
@@ -1084,19 +1140,23 @@ def verify_metadata(filepath):
                 problems.append(f"color_trc={ct or 'missing'}")
 
         elif st == "audio":
-            log(f"    --- Аудио ---")
-            log(f"    Кодек:             {s.get('codec_name', '?')} {s.get('profile', '')}")
+            log(f"    --- Audio ---")
+            log(f"    Codec:             {s.get('codec_name', '?')} "
+                f"{s.get('profile', '')}")
             sr = s.get("sample_rate", "?")
             ok_sr = sr == "48000"
-            log(f"    Sample rate:       {sr} Hz  {'OK' if ok_sr else 'FAIL'}")
-            log(f"    Каналы:            {s.get('channels', '?')}")
+            log(f"    Sample rate:       {sr} Hz  "
+                f"{'OK' if ok_sr else 'FAIL'}")
+            log(f"    Channels:          {s.get('channels', '?')}")
 
-            hn = stags.get("handler_name", "НЕТ")
-            vid = stags.get("vendor_id", "НЕТ")
+            hn = stags.get("handler_name", "NONE")
+            vid = stags.get("vendor_id", "NONE")
             ok_hn = "Core Media" in hn
-            ok_vid = vid in ("[0][0][0][0]", "НЕТ")
-            log(f"    handler_name:      {hn}  {'OK' if ok_hn else 'FAIL'}")
-            log(f"    vendor_id:         {vid}  {'OK' if ok_vid else 'FAIL'}")
+            ok_vid = vid in ("[0][0][0][0]", "NONE")
+            log(f"    handler_name:      {hn}  "
+                f"{'OK' if ok_hn else 'FAIL'}")
+            log(f"    vendor_id:         {vid}  "
+                f"{'OK' if ok_vid else 'FAIL'}")
 
             if not ok_sr:
                 problems.append(f"sample_rate={sr}")
@@ -1107,29 +1167,38 @@ def verify_metadata(filepath):
     ffmpeg_markers = ["Lavf", "Lavc", "FFMP", "libav", "ffmpeg"]
     found = [m for m in ffmpeg_markers if m.lower() in all_text.lower()]
     if found:
-        log(f"    Маркеры ffmpeg:    НАЙДЕНЫ: {', '.join(found)}  FAIL!")
+        log(f"    ffmpeg markers:    FOUND: {', '.join(found)}  FAIL!")
         problems.append(f"ffmpeg markers: {', '.join(found)}")
     else:
-        log(f"    Маркеры ffmpeg:    Не найдены  OK")
+        log(f"    ffmpeg markers:    None found  OK")
 
     log("")
     if problems:
-        log(f"    РЕЗУЛЬТАТ: ПРОБЛЕМЫ НАЙДЕНЫ -- {', '.join(problems)}")
+        log(f"    RESULT: PROBLEMS FOUND -- {', '.join(problems)}")
     else:
-        log(f"    РЕЗУЛЬТАТ: ВСЕ ЧИСТО")
+        log(f"    RESULT: ALL CLEAN")
     log("  " + "=" * 56)
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
+
 def main():
-    log("TikTok Video Uniqualizer v7")
+    log("TikTok Video Uniqualizer v8 -- Structural Modification")
     log("=" * 60)
-    log("Filters: HFLIP + mesh_warp + dct_butterfly + attention_dilution")
-    log(f"  mesh_warp:     grid={MESH_GRID}  amp={MESH_AMP}")
-    log(f"  dct_butterfly: strength={DCT_STRENGTH}")
-    log(f"  attention:     amp={DILUTION_AMP}  threshold={DILUTION_THRESHOLD}")
-    log(f"  audio poison:  offset={AUDIO_PHANTOM_OFFSET_HZ}Hz  amp={AUDIO_PHANTOM_AMP}")
-    log(f"  speed:         {SPEED_FACTOR}x")
-    log(f"  seed:          {FIXED_PROCESSING_SEED:#x} (fixed)")
+    log("Transforms: HFLIP + asymmetric_crop + ken_burns + scene_shuffle")
+    log(f"  crop:      L={CROP_LEFT:.0%} R={CROP_RIGHT:.0%} "
+        f"T={CROP_TOP:.0%} B={CROP_BOTTOM:.0%}")
+    log(f"  ken_burns: zoom {KB_ZOOM_START:.2f}->{KB_ZOOM_END:.2f}  "
+        f"pan ({KB_PAN_X_START:.2f},{KB_PAN_Y_START:.2f})"
+        f"->({KB_PAN_X_END:.2f},{KB_PAN_Y_END:.2f})")
+    log(f"  scenes:    threshold={SCENE_THRESHOLD}  "
+        f"min_frames={MIN_SCENE_FRAMES}  "
+        f"transition={TRANSITION_SEC}s")
+    log(f"  speed:     {SPEED_FACTOR}x")
+    log(f"  seed:      {FIXED_PROCESSING_SEED:#x} (fixed)")
     log("")
 
     check_dependencies()
