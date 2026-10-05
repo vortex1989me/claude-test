@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """
-TikTok Video Uniqualizer v6
+TikTok Video Uniqualizer v7
 ============================
 Processes TikTok-downloaded videos to appear as unique iPhone-recorded content.
 
-Defeats 6 levels of duplicate detection:
-  1. File hash          -- any re-encode breaks this
-  2. Perceptual hashing -- HFLIP + low-frequency luminance pattern + color grading
-  3. Audio fingerprint  -- STFT phase perturbation + constellation poisoning + echo
-  4. Deep embeddings    -- vignette + fade + grain change semantic signature
-  5. Invisible watermarks -- re-encode overwrites DCT coefficients
-  6. Container forensics -- binary MOV patching: qt brand, iPhone handler names,
-                            Apple metadata, bt709 color space, no ffmpeg markers
-
-Key innovation over previous 40 failed methods: fixing container-level metadata
-that instantly flags ffmpeg processing BEFORE content analysis even begins.
+Processing pipeline:
+  - HFLIP (horizontal mirror)
+  - Mesh warp (cv2 spatial deformation on grid)
+  - DCT butterfly (mid-frequency perturbation in YUV domain)
+  - Attention dilution (texture injection in uniform areas)
+  - Constellation poisoning (phantom audio frequency peaks)
+  - iPhone metadata spoofing (QuickTime container, Apple metadata, bt709 color)
+  - Binary MOV patching (ftyp, hdlr, stco/co64, ffmpeg marker scrub)
 """
 
 # ============================================================
-# CONFIGURATION -- all tunable parameters in one place
+# CONFIGURATION
 # ============================================================
 
 # --- Paths ---
@@ -29,44 +26,42 @@ OUTPUT_START_NUMBER = 1001
 SUPPORTED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 
 # --- Video encoding ---
-HFLIP = True                       # Horizontal mirror -- ALWAYS ON
-CRF = 23                          # Quality (23 = iPhone-like bitrate, ~15 Mbps)
-PRESET = "slow"                   # x264 preset (slow = good compression)
-VIDEO_PROFILE = "high"            # H.264 profile
-VIDEO_LEVEL = "4.0"               # H.264 level
-GOP_SIZE = 30                     # Keyframe interval (1 sec at 30fps)
-SPEED_FACTOR = 1.025              # Playback speed multiplier (2.5% faster)
+HFLIP = True
+CRF = 23
+PRESET = "slow"
+VIDEO_PROFILE = "high"
+VIDEO_LEVEL = "4.0"
+GOP_SIZE = 30
+SPEED_FACTOR = 1.025
 
 # --- Fixed seed for identical processing across all videos ---
-FIXED_PROCESSING_SEED = 0xDEAD_BEEF  # Same filters for every video, every run
+FIXED_PROCESSING_SEED = 0xDEAD_BEEF
 
-# --- Per-channel color grading (gamma) ---
-GAMMA_R = 1.07                    # Warm reds aggressively
-GAMMA_G = 1.02                    # Slight green lift
-GAMMA_B = 0.94                    # Cool blues aggressively
+# --- Mesh warp (cv2 spatial deformation) ---
+MESH_GRID = 16           # Control points per axis (was 8)
+MESH_AMP = 4.0           # Max pixel displacement (was 2.0)
 
-# --- Visual effects ---
-FADE_FRAMES = 35                  # Frames for fade-in / fade-out
-VIGNETTE_STRENGTH = 0.15          # Corner darkening intensity (max before visible)
-GRAIN_STRENGTH = 2.8              # Film grain sigma (max before noticeable)
-LF_PATTERN_AMPLITUDE = 3.5       # Low-freq luminance pattern (max before visible)
-LF_PATTERN_TEMPORAL_SPEED = 0.05  # Temporal drift rate of pattern
+# --- DCT butterfly (mid-frequency perturbation) ---
+DCT_STRENGTH = 0.15      # Perturbation amplitude (was 0.08)
 
-# --- Audio processing ---
-AUDIO_SAMPLE_RATE = 48000         # iPhone records at 48 kHz
-AUDIO_BITRATE = "192k"            # AAC output bitrate
-AUDIO_PHASE_PERTURBATION = 0.35   # STFT phase noise amplitude (radians, max)
-AUDIO_STFT_NOISE_FACTOR = 0.008   # Spectral noise relative to mean magnitude
-AUDIO_MICRO_ECHO_DELAY_MS = 7     # Micro-echo delay (ms)
-AUDIO_MICRO_ECHO_DECAY = 0.14     # Micro-echo amplitude (max before audible)
-AUDIO_HARMONIC_STRENGTH = 0.008   # Second-harmonic injection level
+# --- Attention dilution (texture in flat areas) ---
+DILUTION_AMP = 8         # Noise amplitude (was 4)
+DILUTION_THRESHOLD = 18  # Flat-area std cutoff (was 12)
+DILUTION_BLOCK = 16      # Block size for uniformity check
+
+# --- Audio constellation poisoning ---
+AUDIO_SAMPLE_RATE = 48000
+AUDIO_BITRATE = "192k"
+AUDIO_PHANTOM_OFFSET_HZ = 120   # Phantom peak offset Hz (was 75)
+AUDIO_PHANTOM_AMP = 0.95        # Phantom peak amplitude (was 0.80)
+AUDIO_PHANTOM_PEAKS_MULT = 8    # Peaks per second of audio (was 3)
 
 # --- iPhone device metadata ---
 DEVICE_MAKE = "Apple"
 DEVICE_MODEL = "iPhone 15"
 DEVICE_SOFTWARE = "26.6"
-TIMEZONE_HOURS = 3                # UTC offset for com.apple.quicktime.creationdate
-BASE_DATE = "2026-10-04"          # Base date for deterministic timestamps
+TIMEZONE_HOURS = 3
+BASE_DATE = "2026-10-04"
 
 # ============================================================
 # IMPORTS
@@ -83,18 +78,22 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import numpy as np
 
+try:
+    import cv2
+except ImportError:
+    print("ERROR: opencv-python required. Install: pip install opencv-python-headless")
+    sys.exit(1)
+
 # ============================================================
 # UTILITY FUNCTIONS
 # ============================================================
 
 
 def log(msg):
-    """Print timestamped log message."""
     print(f"[uniqualizer] {msg}", flush=True)
 
 
 def sha256_file(filepath):
-    """Compute SHA-256 of a file for deterministic seeding."""
     h = hashlib.sha256()
     with open(filepath, "rb") as f:
         while True:
@@ -105,13 +104,7 @@ def sha256_file(filepath):
     return h.hexdigest()
 
 
-def get_seed(file_hash):
-    """Derive a 31-bit deterministic seed from a hex hash."""
-    return int(file_hash[:8], 16) % (2**31)
-
-
 def get_video_info(filepath):
-    """Return ffprobe JSON for a media file."""
     cmd = [
         "ffprobe", "-v", "quiet",
         "-print_format", "json",
@@ -125,7 +118,6 @@ def get_video_info(filepath):
 
 
 def parse_fps(rate_str):
-    """Parse an FPS string like '30/1' or '29.97' to float."""
     if "/" in str(rate_str):
         parts = str(rate_str).split("/")
         denom = float(parts[1])
@@ -137,15 +129,12 @@ def parse_fps(rate_str):
 
 
 def get_rotation(info):
-    """Extract rotation degrees from ffprobe output."""
     for stream in info.get("streams", []):
         if stream.get("codec_type") != "video":
             continue
-        # Check side_data_list (modern ffprobe)
         for sd in stream.get("side_data_list", []):
             if "rotation" in sd:
                 return int(sd["rotation"])
-        # Fallback to tags
         rot = stream.get("tags", {}).get("rotate", "0")
         try:
             return int(rot)
@@ -155,7 +144,6 @@ def get_rotation(info):
 
 
 def make_creation_date(file_hash):
-    """Deterministic creation date derived from file hash."""
     tz = timezone(timedelta(hours=TIMEZONE_HOURS))
     base = datetime.strptime(BASE_DATE, "%Y-%m-%d").replace(tzinfo=tz)
     hour = int(file_hash[8:10], 16) % 24
@@ -165,8 +153,7 @@ def make_creation_date(file_hash):
 
 
 def format_apple_date(dt):
-    """Format datetime for com.apple.quicktime.creationdate (ISO + tz)."""
-    off = dt.strftime("%z")  # e.g. +0300
+    off = dt.strftime("%z")
     if len(off) >= 5:
         tz_str = f"{off[:3]}:{off[3:]}"
     else:
@@ -175,13 +162,11 @@ def format_apple_date(dt):
 
 
 def format_utc_date(dt):
-    """Format datetime as UTC string for creation_time tag."""
     utc = dt.astimezone(timezone.utc)
     return utc.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
 
 
 def check_dependencies():
-    """Verify ffmpeg and ffprobe are available."""
     for tool in ("ffmpeg", "ffprobe"):
         try:
             r = subprocess.run([tool, "-version"], capture_output=True)
@@ -198,17 +183,15 @@ def check_dependencies():
 # ============================================================
 
 class Atom:
-    """A QuickTime / ISO BMFF atom (box)."""
     __slots__ = ("type", "data", "children", "header_extra")
 
     def __init__(self, atype, data=None, children=None, header_extra=None):
-        self.type = atype            # 4-byte type code
-        self.data = data             # raw payload for leaf atoms
-        self.children = children or []  # child atoms for containers
-        self.header_extra = header_extra  # extra header bytes (e.g. fullbox ver+flags)
+        self.type = atype
+        self.data = data
+        self.children = children or []
+        self.header_extra = header_extra
 
     def serialize(self):
-        """Serialize this atom (and children) to bytes."""
         if self.children:
             body = self.header_extra or b""
             for child in self.children:
@@ -221,18 +204,15 @@ class Atom:
             return struct.pack(">I", total) + self.type + body
 
 
-# Types that contain child atoms (parsed recursively)
 _CONTAINERS = {
     b"moov", b"trak", b"mdia", b"minf", b"stbl",
     b"udta", b"edts", b"dinf", b"sinf", b"schi",
     b"tref", b"gmhd", b"ilst",
 }
-# Full-box containers: 4 extra bytes (version + flags) before children
 _FULLBOX_CONTAINERS = {b"meta"}
 
 
 def parse_atoms(data, start=0, end=None):
-    """Parse a flat sequence of atoms from *data[start:end]*."""
     if end is None:
         end = len(data)
     atoms = []
@@ -270,15 +250,13 @@ def parse_atoms(data, start=0, end=None):
 
 
 def _build_iphone_ftyp():
-    """Build a QuickTime ftyp atom (major_brand=qt)."""
-    payload = b"qt  "                          # major_brand
-    payload += struct.pack(">I", 0x00000200)   # minor_version  (QT 2.0)
-    payload += b"qt  "                         # compatible_brand
+    payload = b"qt  "
+    payload += struct.pack(">I", 0x00000200)
+    payload += b"qt  "
     return Atom(b"ftyp", data=payload)
 
 
 def _patch_hdlr(atom):
-    """Replace handler name in hdlr atom with iPhone Core Media name."""
     d = atom.data
     if not d or len(d) < 24:
         return atom
@@ -295,7 +273,6 @@ def _patch_hdlr(atom):
 
 
 def _patch_vendor_id(atom):
-    """Zero out FFMP vendor_id in avc1/mp4a sample description atoms."""
     if atom.data and len(atom.data) >= 4:
         d = bytearray(atom.data)
         ffmp = b"FFMP"
@@ -309,7 +286,6 @@ def _patch_vendor_id(atom):
 
 
 def _modify_atoms(atoms):
-    """Walk atom tree: fix ftyp, hdlr, remove encoder tags, patch vendor_id."""
     out = []
     for atom in atoms:
         if atom.type == b"ftyp":
@@ -329,7 +305,6 @@ def _modify_atoms(atoms):
 
 
 def _adjust_stco(atoms, delta):
-    """Shift all chunk-offset entries (stco / co64) by *delta* bytes."""
     for atom in atoms:
         if atom.type == b"stco" and atom.data and len(atom.data) >= 8:
             d = bytearray(atom.data)
@@ -354,7 +329,6 @@ def _adjust_stco(atoms, delta):
 
 
 def _has_apple_metadata(atoms):
-    """Return True if the atom tree already contains Apple mdta-style metadata."""
     for atom in atoms:
         if atom.type == b"keys":
             return True
@@ -364,8 +338,7 @@ def _has_apple_metadata(atoms):
 
 
 def _build_keys_atom(key_names):
-    """Build a QuickTime 'keys' atom from a list of key name strings."""
-    body = struct.pack(">I", 0)              # version + flags
+    body = struct.pack(">I", 0)
     body += struct.pack(">I", len(key_names))
     for name in key_names:
         nb = name.encode("utf-8")
@@ -376,7 +349,6 @@ def _build_keys_atom(key_names):
 
 
 def _build_ilst_atom(values):
-    """Build a QuickTime 'ilst' atom with UTF-8 data items for each value."""
     children = []
     for i, value in enumerate(values):
         idx = i + 1
@@ -389,11 +361,9 @@ def _build_ilst_atom(values):
 
 
 def _ensure_apple_metadata(atoms, apple_date_str, utc_date_str):
-    """Add Apple QuickTime metadata to moov/udta/meta if not already present."""
     if _has_apple_metadata(atoms):
         return
 
-    # Find moov
     moov = None
     for atom in atoms:
         if atom.type == b"moov":
@@ -402,7 +372,6 @@ def _ensure_apple_metadata(atoms, apple_date_str, utc_date_str):
     if moov is None or not moov.children:
         return
 
-    # Find or create udta inside moov
     udta = None
     for child in moov.children:
         if child.type == b"udta":
@@ -412,12 +381,11 @@ def _ensure_apple_metadata(atoms, apple_date_str, utc_date_str):
         udta = Atom(b"udta", children=[])
         moov.children.append(udta)
 
-    # Build metadata handler
     hdlr_data = (
-        b"\x00\x00\x00\x00"      # version + flags
-        b"\x00\x00\x00\x00"      # pre_defined
-        b"mdta"                   # handler_type
-        + b"\x00" * 12            # reserved
+        b"\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00"
+        b"mdta"
+        + b"\x00" * 12
         + b"Core Media Metadata\x00"
     )
     hdlr_atom = Atom(b"hdlr", data=hdlr_data)
@@ -445,13 +413,6 @@ def _ensure_apple_metadata(atoms, apple_date_str, utc_date_str):
 
 
 def patch_mov_file(filepath, apple_date_str, utc_date_str):
-    """
-    Binary-patch a MOV file so its container metadata matches a real iPhone.
-
-    Fixes: ftyp brand -> qt, hdlr handler names -> Core Media *,
-    removes encoder tags, adds Apple QuickTime metadata if absent.
-    Adjusts stco / co64 chunk offsets after any size changes.
-    """
     log("  Patching MOV binary metadata...")
 
     with open(filepath, "rb") as f:
@@ -459,7 +420,6 @@ def patch_mov_file(filepath, apple_date_str, utc_date_str):
 
     atoms = parse_atoms(file_data)
 
-    # Split into pre-mdat, mdat, post-mdat
     pre_mdat = []
     mdat_atom = None
     post_mdat = []
@@ -477,18 +437,14 @@ def patch_mov_file(filepath, apple_date_str, utc_date_str):
         log("  WARNING: no mdat atom -- skipping binary patch")
         return
 
-    # Measure original pre-mdat byte size
     old_pre_size = sum(len(a.serialize()) for a in pre_mdat)
 
-    # Modify atoms
     pre_mdat = _modify_atoms(pre_mdat)
     post_mdat = _modify_atoms(post_mdat)
 
-    # Add Apple metadata if missing
     _ensure_apple_metadata(pre_mdat, apple_date_str, utc_date_str)
     _ensure_apple_metadata(post_mdat, apple_date_str, utc_date_str)
 
-    # Compute byte-offset delta and fix chunk offsets
     new_pre_size = sum(len(a.serialize()) for a in pre_mdat)
     delta = new_pre_size - old_pre_size
     if delta != 0:
@@ -496,7 +452,6 @@ def patch_mov_file(filepath, apple_date_str, utc_date_str):
         _adjust_stco(pre_mdat, delta)
         _adjust_stco(post_mdat, delta)
 
-    # Reassemble file
     output = bytearray()
     for a in pre_mdat:
         output.extend(a.serialize())
@@ -507,9 +462,6 @@ def patch_mov_file(filepath, apple_date_str, utc_date_str):
     with open(filepath, "wb") as f:
         f.write(output)
 
-    # Binary scrub: re-read the entire file and replace ALL ffmpeg markers.
-    # Done as a second pass on the full file to catch markers inside stsd
-    # and any other opaque atoms the tree parser does not descend into.
     log("    Scrubbing ffmpeg markers...")
     with open(filepath, "rb") as f:
         raw = bytearray(f.read())
@@ -554,7 +506,6 @@ def patch_mov_file(filepath, apple_date_str, utc_date_str):
 
 
 def _extract_audio(input_path, output_wav):
-    """Extract audio from input as 48 kHz stereo WAV. Returns False if no audio."""
     cmd = [
         "ffmpeg", "-y", "-nostdin",
         "-i", input_path,
@@ -570,17 +521,15 @@ def _extract_audio(input_path, output_wav):
 
 
 def _read_wav(filepath):
-    """Read a PCM WAV file into (int16 ndarray, sample_rate, channels)."""
     with open(filepath, "rb") as f:
         if f.read(4) != b"RIFF":
             raise ValueError("not a WAV file")
-        f.read(4)  # file size
+        f.read(4)
         if f.read(4) != b"WAVE":
             raise ValueError("not a WAV file")
 
         channels = 2
         sample_rate = AUDIO_SAMPLE_RATE
-        bits = 16
         audio_bytes = b""
 
         while True:
@@ -593,7 +542,6 @@ def _read_wav(filepath):
                 fmt = f.read(csz)
                 channels = struct.unpack("<H", fmt[2:4])[0]
                 sample_rate = struct.unpack("<I", fmt[4:8])[0]
-                bits = struct.unpack("<H", fmt[14:16])[0]
             elif cid == b"data":
                 audio_bytes = f.read(csz)
                 break
@@ -609,14 +557,13 @@ def _read_wav(filepath):
 
 
 def _write_wav(filepath, data, sample_rate, channels=2):
-    """Write int16 ndarray to WAV file."""
     if data.ndim == 2:
         n_samples = data.shape[0]
     else:
         n_samples = len(data)
         channels = 1
 
-    bps = 2  # bytes per sample (16-bit)
+    bps = 2
     data_size = n_samples * channels * bps
 
     with open(filepath, "wb") as f:
@@ -625,123 +572,70 @@ def _write_wav(filepath, data, sample_rate, channels=2):
         f.write(b"WAVE")
         f.write(b"fmt ")
         f.write(struct.pack("<I", 16))
-        f.write(struct.pack("<H", 1))             # PCM
+        f.write(struct.pack("<H", 1))
         f.write(struct.pack("<H", channels))
         f.write(struct.pack("<I", sample_rate))
         f.write(struct.pack("<I", sample_rate * channels * bps))
         f.write(struct.pack("<H", channels * bps))
-        f.write(struct.pack("<H", 16))             # bits
+        f.write(struct.pack("<H", 16))
         f.write(b"data")
         f.write(struct.pack("<I", data_size))
         f.write(data.astype(np.int16).tobytes())
 
 
-def _process_audio_channel(samples, rng, sample_rate):
-    """
-    Process one channel of audio (float32, range -1..1).
-
-    1. STFT phase perturbation + constellation noise  (defeats Shazam)
-    2. Micro-echo at non-standard delay               (shifts spectral peaks)
-    3. Second-harmonic injection                       (adds energy Content ID
-                                                        does not expect)
-    """
+def _constellation_poison_mono(samples, sr, rng):
+    """Inject phantom frequency peaks near the strongest spectral peaks."""
     n = len(samples)
-    window_size = 2048
-    hop_size = 512
-    window = np.hanning(window_size).astype(np.float32)
+    spectrum = np.fft.rfft(samples)
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
 
-    # Frequency-bin range for Shazam-sensitive band (200 Hz -- 5000 Hz)
-    low_bin = max(1, int(200 * window_size / sample_rate))
-    high_bin = min(window_size // 2, int(5000 * window_size / sample_rate))
-    n_target = max(1, high_bin - low_bin)
+    n_peaks = max(10, n // sr * AUDIO_PHANTOM_PEAKS_MULT)
+    peak_indices = np.argsort(np.abs(spectrum))[-n_peaks:]
 
-    n_frames = max(0, (n - window_size) // hop_size + 1)
-    output = np.zeros(n, dtype=np.float32)
-    win_sum = np.zeros(n, dtype=np.float32)
+    for idx in peak_indices:
+        if idx < len(freqs):
+            freq = freqs[idx]
+            for target_f in [freq + AUDIO_PHANTOM_OFFSET_HZ,
+                             freq - AUDIO_PHANTOM_OFFSET_HZ]:
+                if 20 < target_f < sr / 2:
+                    target_idx = int(target_f * n / sr)
+                    if 0 < target_idx < len(spectrum):
+                        phase = rng.uniform(0, 2 * np.pi)
+                        spectrum[target_idx] += (
+                            np.abs(spectrum[idx]) * AUDIO_PHANTOM_AMP
+                            * np.exp(1j * phase)
+                        )
 
-    for i in range(n_frames):
-        start = i * hop_size
-        end = start + window_size
-        if end > n:
-            break
-
-        frame = samples[start:end] * window
-        spectrum = np.fft.rfft(frame)
-        mag = np.abs(spectrum)
-        phase = np.angle(spectrum)
-
-        # Phase perturbation in Shazam-sensitive band
-        phase_noise = rng.uniform(
-            -AUDIO_PHASE_PERTURBATION, AUDIO_PHASE_PERTURBATION, n_target
-        ).astype(np.float32)
-        phase[low_bin:high_bin] += phase_noise
-
-        # Add spectral noise to shift constellation peaks
-        mean_mag = max(float(np.mean(mag[low_bin:high_bin])), 1e-10)
-        noise_mag = rng.exponential(
-            AUDIO_STFT_NOISE_FACTOR * mean_mag, n_target
-        ).astype(np.float32)
-        mag[low_bin:high_bin] += noise_mag
-
-        spectrum = mag * np.exp(1j * phase)
-        recon = np.fft.irfft(spectrum, n=window_size).astype(np.float32)
-
-        output[start:end] += recon * window
-        win_sum[start:end] += window * window
-
-    # Normalize overlap-add; keep unprocessed tail as-is
-    mask = win_sum > 1e-8
-    output[mask] /= win_sum[mask]
-    output[~mask] = samples[~mask]
-
-    # Micro-echo
-    delay = int(AUDIO_MICRO_ECHO_DELAY_MS * sample_rate / 1000)
-    if 0 < delay < n:
-        echoed = np.copy(output)
-        echoed[delay:] += output[:-delay] * AUDIO_MICRO_ECHO_DECAY
-        output = echoed
-
-    # Second-harmonic injection
-    if AUDIO_HARMONIC_STRENGTH > 0:
-        harmonic = output * output * AUDIO_HARMONIC_STRENGTH
-        harmonic -= np.mean(harmonic)  # strip DC
-        output += harmonic
-
-    return output
+    return np.fft.irfft(spectrum, n=n)
 
 
 def process_audio(input_wav, output_wav, rng):
-    """Full audio processing pipeline: STFT + echo + harmonics + speed."""
+    """Constellation poisoning + speed change."""
     log("  Processing audio...")
     data, sr, channels = _read_wav(input_wav)
 
-    # To float
-    fdata = data.astype(np.float32) / 32768.0
+    fdata = data.astype(np.float64) / 32768.0
 
-    # Process each channel independently (different phase perturbations break
-    # Shazam's mono-mix heuristic)
     if channels > 1 and fdata.ndim == 2:
         for ch in range(channels):
             ch_rng = np.random.default_rng(int(rng.integers(0, 2**31)) + ch)
-            fdata[:, ch] = _process_audio_channel(fdata[:, ch], ch_rng, sr)
+            fdata[:, ch] = _constellation_poison_mono(fdata[:, ch], sr, ch_rng)
     else:
-        fdata = _process_audio_channel(fdata.ravel(), rng, sr)
+        fdata = _constellation_poison_mono(fdata.ravel(), sr, rng)
 
-    # Speed change (resample to match video speed factor)
     if SPEED_FACTOR != 1.0:
         old_len = fdata.shape[0]
         new_len = int(old_len / SPEED_FACTOR)
         old_x = np.linspace(0, 1, old_len)
         new_x = np.linspace(0, 1, new_len)
         if fdata.ndim == 2:
-            new_data = np.zeros((new_len, channels), dtype=np.float32)
+            new_data = np.zeros((new_len, channels), dtype=np.float64)
             for ch in range(channels):
                 new_data[:, ch] = np.interp(new_x, old_x, fdata[:, ch])
             fdata = new_data
         else:
-            fdata = np.interp(new_x, old_x, fdata).astype(np.float32)
+            fdata = np.interp(new_x, old_x, fdata)
 
-    # Back to int16
     fdata = np.clip(fdata, -1.0, 1.0)
     int_data = (fdata * 32767).astype(np.int16)
     _write_wav(output_wav, int_data, sr, channels)
@@ -754,97 +648,117 @@ def process_audio(input_wav, output_wav, rng):
 
 class FrameProcessor:
     """
-    Deterministic per-frame video processing.
+    Per-frame video processing with cv2-based spatial and frequency filters.
 
-    Precomputes lookup tables, vignette map, low-frequency pattern, and grain
-    weights once.  The ``process`` method is called for every decoded frame.
+    Precomputes mesh warp displacement maps once. DCT and attention dilution
+    use fixed-seed RNGs for determinism.
     """
 
-    def __init__(self, width, height, total_frames, rng):
+    def __init__(self, width, height, rng):
         self.w = width
         self.h = height
-        self.total_frames = total_frames
-        self.eff_fade = min(FADE_FRAMES, total_frames // 3) if total_frames > 0 else 0
+        self._precompute_mesh(rng)
+        self.dct_seed = int(rng.integers(0, 2**31))
+        self.dilution_seed = int(rng.integers(0, 2**31))
 
-        # Per-channel gamma LUTs (uint8 -> uint8)
-        x = np.arange(256, dtype=np.float64) / 255.0
-        self.lut_b = np.clip(255.0 * x ** (1.0 / GAMMA_B), 0, 255).astype(np.uint8)
-        self.lut_g = np.clip(255.0 * x ** (1.0 / GAMMA_G), 0, 255).astype(np.uint8)
-        self.lut_r = np.clip(255.0 * x ** (1.0 / GAMMA_R), 0, 255).astype(np.uint8)
-
-        # Vignette map (h, w, 1) for broadcasting
-        Y = np.linspace(-1, 1, height).reshape(-1, 1).astype(np.float32)
-        X = np.linspace(-1, 1, width).reshape(1, -1).astype(np.float32)
-        radius = np.sqrt(X * X + Y * Y)
-        vig = 1.0 - VIGNETTE_STRENGTH * np.clip(radius - 0.7, 0, None) ** 2
-        self.vignette = np.clip(vig, 0, 1).astype(np.float32)[:, :, np.newaxis]
-
-        # Low-frequency luminance pattern (h, w, 3)
-        phase_x = float(rng.uniform(0, 2 * np.pi))
-        phase_y = float(rng.uniform(0, 2 * np.pi))
-        Xp = np.arange(width, dtype=np.float32).reshape(1, -1) * (2 * np.pi * 3 / width)
-        Yp = np.arange(height, dtype=np.float32).reshape(-1, 1) * (2 * np.pi * 2 / height)
-        base_pattern = (np.sin(Xp + phase_x) * np.sin(Yp + phase_y) * LF_PATTERN_AMPLITUDE)
-        # Channel weights: B*0.8, G*1.0, R*0.8
-        self.lf_pattern = np.stack(
-            [base_pattern * 0.8, base_pattern, base_pattern * 0.8], axis=2
+    def _precompute_mesh(self, rng):
+        h, w = self.h, self.w
+        dx = rng.uniform(
+            -MESH_AMP, MESH_AMP, (MESH_GRID + 1, MESH_GRID + 1)
         ).astype(np.float32)
+        dy = rng.uniform(
+            -MESH_AMP, MESH_AMP, (MESH_GRID + 1, MESH_GRID + 1)
+        ).astype(np.float32)
+        dx[0, :] = dx[-1, :] = dx[:, 0] = dx[:, -1] = 0
+        dy[0, :] = dy[-1, :] = dy[:, 0] = dy[:, -1] = 0
 
-        # Grain channel weights (1, 1, 3) for broadcasting
-        self.grain_weights = np.array(
-            [0.8, 1.0, 0.8], dtype=np.float32
-        ).reshape(1, 1, 3)
+        full_dx = cv2.resize(dx, (w, h), interpolation=cv2.INTER_LINEAR)
+        full_dy = cv2.resize(dy, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        # Base seed for per-frame grain RNG
-        self.grain_seed = int(rng.integers(0, 2**31))
+        base_x = np.broadcast_to(
+            np.arange(w, dtype=np.float32)[np.newaxis, :], (h, w)
+        ).copy()
+        base_y = np.broadcast_to(
+            np.arange(h, dtype=np.float32)[:, np.newaxis], (h, w)
+        ).copy()
+
+        self.map_x = base_x + full_dx
+        self.map_y = base_y + full_dy
 
     def process(self, frame, frame_idx):
         """
-        Process a single BGR uint8 frame in-place-ish. Returns uint8 ndarray.
+        Process a single BGR uint8 frame.
 
-        Operations (order matters for quality):
-          1. Horizontal flip
-          2. Per-channel gamma via LUT
-          3. Low-frequency luminance pattern (temporally drifting)
-          4. Film grain
-          5. Vignette
-          6. Fade-in / fade-out
+        1. Horizontal flip
+        2. Mesh warp (precomputed displacement)
+        3. DCT butterfly (mid-frequency perturbation)
+        4. Attention dilution (texture in uniform areas)
         """
-        # 1. HFLIP  (mandatory)
-        frame = np.ascontiguousarray(frame[:, ::-1, :])
+        # 1. HFLIP
+        if HFLIP:
+            frame = np.ascontiguousarray(frame[:, ::-1, :])
 
-        # 2. Color grading via LUT  (uint8 domain -- fast)
-        frame[:, :, 0] = self.lut_b[frame[:, :, 0]]
-        frame[:, :, 1] = self.lut_g[frame[:, :, 1]]
-        frame[:, :, 2] = self.lut_r[frame[:, :, 2]]
+        # 2. Mesh warp
+        frame = cv2.remap(
+            frame, self.map_x, self.map_y,
+            cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101,
+        )
 
-        # Switch to float for additive / multiplicative ops
-        f = frame.astype(np.float32)
+        # 3. DCT butterfly
+        yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
+        y_ch = yuv[:, :, 0].astype(np.float32)
+        dft = np.fft.fft2(y_ch)
+        fh, fw = y_ch.shape
+        mid_h = slice(fh // 4, 3 * fh // 4)
+        mid_w = slice(fw // 4, 3 * fw // 4)
 
-        # 3. Low-frequency pattern with temporal drift
-        temporal_mod = 1.0 + 0.2 * np.sin(frame_idx * LF_PATTERN_TEMPORAL_SPEED)
-        f += self.lf_pattern * temporal_mod
+        dct_rng = np.random.default_rng(self.dct_seed)
+        perturbation = dct_rng.normal(0, DCT_STRENGTH, dft[mid_h, mid_w].shape)
+        magnitude = np.abs(dft[mid_h, mid_w])
+        median_mag = (
+            float(np.median(magnitude[magnitude > 0]))
+            if np.any(magnitude > 0) else 1.0
+        )
+        mask = (magnitude > median_mag * 0.5) & (magnitude < median_mag * 2.0)
+        dft[mid_h, mid_w] += perturbation * mask * median_mag
 
-        # 4. Film grain (deterministic per frame via seed)
-        grain_rng = np.random.default_rng(self.grain_seed + frame_idx)
-        grain = grain_rng.normal(0, GRAIN_STRENGTH, (self.h, self.w)).astype(np.float32)
-        f += grain[:, :, np.newaxis] * self.grain_weights
+        y_new = np.fft.ifft2(dft).real
+        yuv[:, :, 0] = np.clip(y_new, 0, 255).astype(np.uint8)
+        frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
 
-        # 5. Vignette
-        f *= self.vignette
+        # 4. Attention dilution (vectorized)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gh, gw = gray.shape
+        block = DILUTION_BLOCK
+        th = (gh // block) * block
+        tw = (gw // block) * block
 
-        # 6. Fade-in / fade-out
-        if self.eff_fade > 0:
-            if frame_idx < self.eff_fade:
-                factor = 0.92 + 0.08 * (frame_idx / self.eff_fade)
-                f *= factor
-            elif (self.total_frames > 0
-                  and frame_idx >= self.total_frames - self.eff_fade):
-                remaining = self.total_frames - 1 - frame_idx
-                factor = 0.92 + 0.08 * max(0.0, remaining / self.eff_fade)
-                f *= factor
+        if th > 0 and tw > 0:
+            n_by = th // block
+            n_bx = tw // block
+            gray_blocks = (
+                gray[:th, :tw]
+                .reshape(n_by, block, n_bx, block)
+                .transpose(0, 2, 1, 3)
+            )
+            stds = gray_blocks.astype(np.float32).std(axis=(2, 3))
+            uniform_mask = stds < DILUTION_THRESHOLD
 
-        return np.clip(f, 0, 255).astype(np.uint8)
+            if np.any(uniform_mask):
+                dil_rng = np.random.default_rng(self.dilution_seed)
+                noise = dil_rng.integers(
+                    -DILUTION_AMP, DILUTION_AMP + 1,
+                    (th, tw, 3), dtype=np.int16,
+                )
+                pixel_mask = np.repeat(
+                    np.repeat(uniform_mask, block, axis=0),
+                    block, axis=1,
+                )
+                region = frame[:th, :tw].astype(np.int16)
+                region += noise * pixel_mask[:, :, np.newaxis]
+                frame[:th, :tw] = np.clip(region, 0, 255).astype(np.uint8)
+
+        return frame
 
 
 # ============================================================
@@ -853,24 +767,12 @@ class FrameProcessor:
 
 
 def process_video(input_path, output_path):
-    """
-    End-to-end processing of one video file.
-
-    Pipeline:
-      1. Hash input for deterministic seed
-      2. Probe input properties (resolution, fps, rotation, duration)
-      3. Extract and process audio
-      4. Decode -> per-frame processing -> encode  (pipe-based)
-      5. Binary-patch the output MOV for iPhone metadata
-    """
     log(f"Processing: {input_path}")
 
-    # --- Fixed seed: identical processing for every video ---
     file_hash = sha256_file(input_path)
     rng = np.random.default_rng(FIXED_PROCESSING_SEED)
     log(f"  Hash: {file_hash[:16]}...  Seed: {FIXED_PROCESSING_SEED:#x} (fixed)")
 
-    # --- Probe input ---
     info = get_video_info(input_path)
 
     v_stream = None
@@ -894,17 +796,14 @@ def process_video(input_path, output_path):
         fps = 30.0
     rotation = get_rotation(info)
 
-    # Display dimensions (after rotation)
     if rotation in (90, -90, 270, -270):
         display_w, display_h = coded_h, coded_w
     else:
         display_w, display_h = coded_w, coded_h
 
-    # Ensure even dimensions (required by yuv420p)
     display_w = display_w // 2 * 2
     display_h = display_h // 2 * 2
 
-    # Duration and frame count
     duration = 0.0
     try:
         duration = float(info.get("format", {}).get("duration", 0))
@@ -930,20 +829,17 @@ def process_video(input_path, output_path):
     log(f"  Output:  {display_w}x{display_h} @ {out_fps:.2f}fps, "
         f"~{total_frames} frames")
 
-    # --- Creation date ---
     creation_dt = make_creation_date(file_hash)
     apple_date = format_apple_date(creation_dt)
     utc_date = format_utc_date(creation_dt)
     log(f"  Date:    {apple_date}")
 
-    # --- Temp files ---
     temp_dir = os.path.join(os.path.dirname(os.path.abspath(output_path)),
                             ".uniqualizer_temp")
     os.makedirs(temp_dir, exist_ok=True)
     temp_audio_in = os.path.join(temp_dir, "audio_in.wav")
     temp_audio_out = os.path.join(temp_dir, "audio_out.wav")
 
-    # --- Audio ---
     has_audio = a_stream is not None
     if has_audio:
         has_audio = _extract_audio(input_path, temp_audio_in)
@@ -951,15 +847,14 @@ def process_video(input_path, output_path):
             audio_rng = np.random.default_rng(FIXED_PROCESSING_SEED + 1)
             process_audio(temp_audio_in, temp_audio_out, audio_rng)
 
-    # --- Build ffmpeg DECODE command ---
+    # --- DECODE command ---
     decode_vf = []
     if rotation in (90, -270):
-        decode_vf.append("transpose=2")       # counter-clockwise 90
+        decode_vf.append("transpose=2")
     elif rotation in (-90, 270):
-        decode_vf.append("transpose=1")       # clockwise 90
+        decode_vf.append("transpose=1")
     elif rotation in (180, -180):
         decode_vf.append("transpose=2,transpose=2")
-    # Force even dimensions
     decode_vf.append(f"scale={display_w}:{display_h}")
 
     decode_cmd = [
@@ -971,10 +866,9 @@ def process_video(input_path, output_path):
         "pipe:1",
     ]
 
-    # --- Build ffmpeg ENCODE command ---
+    # --- ENCODE command ---
     encode_cmd = [
         "ffmpeg", "-y", "-nostdin",
-        # raw video from pipe
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
         "-s", f"{display_w}x{display_h}",
@@ -984,10 +878,9 @@ def process_video(input_path, output_path):
     if has_audio:
         encode_cmd.extend(["-i", temp_audio_out])
 
-    encode_vf = f"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
+    encode_vf = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
 
     encode_cmd.extend([
-        # video codec
         "-c:v", "libx264",
         "-preset", PRESET,
         "-crf", str(CRF),
@@ -997,13 +890,11 @@ def process_video(input_path, output_path):
         "-g", str(GOP_SIZE),
         "-bf", "2",
         "-vf", encode_vf,
-        # color space (belt and suspenders with setparams above)
         "-colorspace", "bt709",
         "-color_trc", "bt709",
         "-color_primaries", "bt709",
         "-color_range", "tv",
         "-tag:v", "avc1",
-        # bitexact for determinism and to suppress encoder tag
         "-flags:v", "+bitexact",
         "-flags:a", "+bitexact",
         "-fflags", "+bitexact",
@@ -1021,7 +912,6 @@ def process_video(input_path, output_path):
         ])
 
     encode_cmd.extend([
-        # strip input metadata, then set our own
         "-map_metadata", "-1",
         "-movflags", "+write_colr+use_metadata_tags+faststart",
         "-metadata", f"com.apple.quicktime.make={DEVICE_MAKE}",
@@ -1034,10 +924,10 @@ def process_video(input_path, output_path):
         output_path,
     ])
 
-    # --- Initialize frame processor ---
-    frame_proc = FrameProcessor(display_w, display_h, total_frames, rng)
+    # --- Frame processor ---
+    frame_proc = FrameProcessor(display_w, display_h, rng)
 
-    # --- Run pipeline ---
+    # --- Pipeline ---
     log("  Starting pipe-based encode...")
     frame_size = display_w * display_h * 3
 
@@ -1115,67 +1005,138 @@ def process_video(input_path, output_path):
     in_size = os.path.getsize(input_path) / (1024 * 1024)
     log(f"  Done: {output_path}  ({in_size:.1f} MB -> {out_size:.1f} MB)")
 
-    # --- Metadata check ---
     verify_metadata(output_path)
     return True
 
 
+# ============================================================
+# METADATA VERIFICATION
+# ============================================================
+
+
 def verify_metadata(filepath):
-    """Print metadata summary for a processed video file."""
+    """Comprehensive metadata check with indicators."""
     info = get_video_info(filepath)
     tags = info.get("format", {}).get("tags", {})
 
-    log("  --- Метаданные ---")
+    log("")
+    log("  " + "=" * 56)
+    log(f"  ПРОВЕРКА МЕТАДАННЫХ: {os.path.basename(filepath)}")
+    log("  " + "=" * 56)
+
     make = tags.get("com.apple.quicktime.make", "НЕТ")
     model = tags.get("com.apple.quicktime.model", "НЕТ")
     sw = tags.get("com.apple.quicktime.software", "НЕТ")
+    log(f"    Производитель:     {make}")
+    log(f"    Модель:            {model}")
+    log(f"    iOS:               {sw}")
+
     cdate = tags.get("com.apple.quicktime.creationdate", "НЕТ")
+    ctime = tags.get("creation_time", "НЕТ")
+    log(f"    Дата записи:       {cdate}")
+    log(f"    UTC:               {ctime}")
+
     brand = tags.get("major_brand", "НЕТ").strip()
-    log(f"    Устройство:  {make} {model}, iOS {sw}")
-    log(f"    Дата:        {cdate}")
-    log(f"    Контейнер:   major_brand={brand} {'OK' if 'qt' in brand else 'FAIL'}")
+    compat = tags.get("compatible_brands", "НЕТ").strip()
+    ok_brand = "qt" in brand
+    ok_compat = "qt" in compat
+    log(f"    major_brand:       {brand}  {'OK' if ok_brand else 'FAIL'}")
+    log(f"    compatible_brands: {compat}  {'OK' if ok_compat else 'FAIL'}")
 
     problems = []
     for s in info.get("streams", []):
         stags = s.get("tags", {})
-        if s.get("codec_type") == "video":
-            cs = s.get("color_space", "")
-            ct = s.get("color_transfer", "")
-            cp = s.get("color_primaries", "")
-            cr = s.get("color_range", "")
-            hn = stags.get("handler_name", "")
-            vid = stags.get("vendor_id", "")
-            enc = stags.get("encoder", "")
-            log(f"    Видео:       color={cs}/{ct}/{cp} range={cr}")
-            log(f"    Handler:     {hn}  vendor={vid}  encoder={enc}")
-            if "FFMP" in vid:
-                problems.append("vendor_id=FFMP")
-            if "Lavc" in enc or "Lavf" in enc:
-                problems.append(f"encoder={enc}")
-            if ct not in ("bt709",):
-                problems.append(f"color_trc={ct or 'missing'}")
-        elif s.get("codec_type") == "audio":
-            sr = s.get("sample_rate", "")
-            hn = stags.get("handler_name", "")
-            log(f"    Аудио:       {sr}Hz  handler={hn}")
+        st = s.get("codec_type")
 
-    if problems:
-        log(f"    ПРОБЛЕМЫ: {', '.join(problems)}")
+        if st == "video":
+            log(f"    --- Видео ---")
+            log(f"    Кодек:             {s.get('codec_name', '?')} {s.get('profile', '')}")
+            log(f"    Разрешение:        {s.get('width', '?')}x{s.get('height', '?')}")
+            log(f"    FPS:               {s.get('r_frame_rate', '?')}")
+            log(f"    Пиксели:           {s.get('pix_fmt', '?')}")
+
+            cs = s.get("color_space", "НЕТ")
+            ct = s.get("color_transfer", "НЕТ")
+            cp = s.get("color_primaries", "НЕТ")
+            cr = s.get("color_range", "НЕТ")
+            log(f"    color_space:       {cs}  {'OK' if cs == 'bt709' else 'FAIL'}")
+            log(f"    color_transfer:    {ct}  {'OK' if ct == 'bt709' else 'FAIL'}")
+            log(f"    color_primaries:   {cp}  {'OK' if cp == 'bt709' else 'FAIL'}")
+            log(f"    color_range:       {cr}  {'OK' if cr == 'tv' else 'FAIL'}")
+
+            hn = stags.get("handler_name", "НЕТ")
+            vid = stags.get("vendor_id", "НЕТ")
+            enc = stags.get("encoder", "НЕТ")
+            ok_hn = "Core Media" in hn
+            ok_vid = vid in ("[0][0][0][0]", "НЕТ")
+            ok_enc = enc in ("H.264", "НЕТ")
+            log(f"    handler_name:      {hn}  {'OK' if ok_hn else 'FAIL'}")
+            log(f"    vendor_id:         {vid}  {'OK' if ok_vid else 'FAIL'}")
+            log(f"    encoder:           {enc}  {'OK' if ok_enc else 'FAIL'}")
+
+            if not ok_hn:
+                problems.append(f"video handler={hn}")
+            if not ok_vid:
+                problems.append(f"vendor_id={vid}")
+            if not ok_enc:
+                problems.append(f"encoder={enc}")
+            if ct != "bt709":
+                problems.append(f"color_trc={ct or 'missing'}")
+
+        elif st == "audio":
+            log(f"    --- Аудио ---")
+            log(f"    Кодек:             {s.get('codec_name', '?')} {s.get('profile', '')}")
+            sr = s.get("sample_rate", "?")
+            ok_sr = sr == "48000"
+            log(f"    Sample rate:       {sr} Hz  {'OK' if ok_sr else 'FAIL'}")
+            log(f"    Каналы:            {s.get('channels', '?')}")
+
+            hn = stags.get("handler_name", "НЕТ")
+            vid = stags.get("vendor_id", "НЕТ")
+            ok_hn = "Core Media" in hn
+            ok_vid = vid in ("[0][0][0][0]", "НЕТ")
+            log(f"    handler_name:      {hn}  {'OK' if ok_hn else 'FAIL'}")
+            log(f"    vendor_id:         {vid}  {'OK' if ok_vid else 'FAIL'}")
+
+            if not ok_sr:
+                problems.append(f"sample_rate={sr}")
+            if not ok_hn:
+                problems.append(f"audio handler={hn}")
+
+    all_text = json.dumps(info)
+    ffmpeg_markers = ["Lavf", "Lavc", "FFMP", "libav", "ffmpeg"]
+    found = [m for m in ffmpeg_markers if m.lower() in all_text.lower()]
+    if found:
+        log(f"    Маркеры ffmpeg:    НАЙДЕНЫ: {', '.join(found)}  FAIL!")
+        problems.append(f"ffmpeg markers: {', '.join(found)}")
     else:
-        log("    ЧИСТО — никаких маркеров ffmpeg")
+        log(f"    Маркеры ffmpeg:    Не найдены  OK")
+
+    log("")
+    if problems:
+        log(f"    РЕЗУЛЬТАТ: ПРОБЛЕМЫ НАЙДЕНЫ -- {', '.join(problems)}")
+    else:
+        log(f"    РЕЗУЛЬТАТ: ВСЕ ЧИСТО")
+    log("  " + "=" * 56)
 
 
 def main():
-    """Entry point: scan input/ directory, process each video, write to output/."""
-    log("TikTok Video Uniqualizer v6")
+    log("TikTok Video Uniqualizer v7")
     log("=" * 60)
+    log("Filters: HFLIP + mesh_warp + dct_butterfly + attention_dilution")
+    log(f"  mesh_warp:     grid={MESH_GRID}  amp={MESH_AMP}")
+    log(f"  dct_butterfly: strength={DCT_STRENGTH}")
+    log(f"  attention:     amp={DILUTION_AMP}  threshold={DILUTION_THRESHOLD}")
+    log(f"  audio poison:  offset={AUDIO_PHANTOM_OFFSET_HZ}Hz  amp={AUDIO_PHANTOM_AMP}")
+    log(f"  speed:         {SPEED_FACTOR}x")
+    log(f"  seed:          {FIXED_PROCESSING_SEED:#x} (fixed)")
+    log("")
 
     check_dependencies()
 
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Collect input files (case-insensitive extension matching)
     input_files = []
     for entry in sorted(Path(INPUT_DIR).iterdir()):
         if entry.is_file() and entry.suffix.lower() in SUPPORTED_EXTENSIONS:
