@@ -30,7 +30,7 @@ SUPPORTED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 
 # --- Video encoding ---
 HFLIP = True                       # Horizontal mirror -- ALWAYS ON
-CRF = 17                          # Quality (17 = near-lossless, max quality)
+CRF = 23                          # Quality (23 = iPhone-like bitrate, ~15 Mbps)
 PRESET = "slow"                   # x264 preset (slow = good compression)
 VIDEO_PROFILE = "high"            # H.264 profile
 VIDEO_LEVEL = "4.0"               # H.264 level
@@ -504,26 +504,46 @@ def patch_mov_file(filepath, apple_date_str, utc_date_str):
     for a in post_mdat:
         output.extend(a.serialize())
 
-    # Binary scrub: remove ffmpeg fingerprints embedded inside stsd and other
-    # opaque atoms that the tree parser does not descend into.
+    with open(filepath, "wb") as f:
+        f.write(output)
+
+    # Binary scrub: re-read the entire file and replace ALL ffmpeg markers.
+    # Done as a second pass on the full file to catch markers inside stsd
+    # and any other opaque atoms the tree parser does not descend into.
+    log("    Scrubbing ffmpeg markers...")
+    with open(filepath, "rb") as f:
+        raw = bytearray(f.read())
+
     ffmpeg_markers = [
         (b"FFMP", b"\x00\x00\x00\x00"),
-        (b"Lavc libx264", b"\x00" * 12),
-        (b"Lavc libx265", b"\x00" * 12),
+        (b"Lavc libx264", b"H.264\x00\x00\x00\x00\x00\x00\x00"),
+        (b"Lavc libx265", b"H.265\x00\x00\x00\x00\x00\x00\x00"),
+        (b"Lavc60", b"\x00\x00\x00\x00\x00\x00"),
+        (b"Lavc61", b"\x00\x00\x00\x00\x00\x00"),
+        (b"Lavc", b"\x00\x00\x00\x00"),
+        (b"Lavf60", b"\x00\x00\x00\x00\x00\x00"),
+        (b"Lavf61", b"\x00\x00\x00\x00\x00\x00"),
         (b"Lavf", b"\x00\x00\x00\x00"),
         (b"libavformat", b"\x00" * 11),
+        (b"libavcodec", b"\x00" * 10),
     ]
+    scrubbed = 0
     for marker, replacement in ffmpeg_markers:
         idx = 0
         while True:
-            idx = output.find(marker, idx)
+            idx = raw.find(marker, idx)
             if idx == -1:
                 break
-            output[idx:idx + len(replacement)] = replacement
+            raw[idx:idx + len(replacement)] = replacement
+            scrubbed += 1
             idx += len(replacement)
 
-    with open(filepath, "wb") as f:
-        f.write(output)
+    if scrubbed > 0:
+        with open(filepath, "wb") as f:
+            f.write(raw)
+        log(f"    Scrubbed {scrubbed} ffmpeg marker(s)")
+    else:
+        log("    No ffmpeg markers found (clean)")
 
     log("    MOV patch complete")
 
@@ -964,6 +984,8 @@ def process_video(input_path, output_path):
     if has_audio:
         encode_cmd.extend(["-i", temp_audio_out])
 
+    encode_vf = f"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
+
     encode_cmd.extend([
         # video codec
         "-c:v", "libx264",
@@ -974,18 +996,19 @@ def process_video(input_path, output_path):
         "-pix_fmt", "yuv420p",
         "-g", str(GOP_SIZE),
         "-bf", "2",
-        # color space
+        "-vf", encode_vf,
+        # color space (belt and suspenders with setparams above)
         "-colorspace", "bt709",
         "-color_trc", "bt709",
         "-color_primaries", "bt709",
-        "-color_range", "1",
+        "-color_range", "tv",
         "-tag:v", "avc1",
         # bitexact for determinism and to suppress encoder tag
         "-flags:v", "+bitexact",
         "-flags:a", "+bitexact",
         "-fflags", "+bitexact",
-        # handler names (best-effort; binary patcher fixes if ignored)
         "-metadata:s:v:0", "handler_name=Core Media Video",
+        "-metadata:s:v:0", "encoder=H.264",
     ])
 
     if has_audio:
@@ -1089,8 +1112,57 @@ def process_video(input_path, output_path):
         pass
 
     out_size = os.path.getsize(output_path) / (1024 * 1024)
-    log(f"  Done: {output_path}  ({out_size:.1f} MB)")
+    in_size = os.path.getsize(input_path) / (1024 * 1024)
+    log(f"  Done: {output_path}  ({in_size:.1f} MB -> {out_size:.1f} MB)")
+
+    # --- Metadata check ---
+    verify_metadata(output_path)
     return True
+
+
+def verify_metadata(filepath):
+    """Print metadata summary for a processed video file."""
+    info = get_video_info(filepath)
+    tags = info.get("format", {}).get("tags", {})
+
+    log("  --- Метаданные ---")
+    make = tags.get("com.apple.quicktime.make", "НЕТ")
+    model = tags.get("com.apple.quicktime.model", "НЕТ")
+    sw = tags.get("com.apple.quicktime.software", "НЕТ")
+    cdate = tags.get("com.apple.quicktime.creationdate", "НЕТ")
+    brand = tags.get("major_brand", "НЕТ").strip()
+    log(f"    Устройство:  {make} {model}, iOS {sw}")
+    log(f"    Дата:        {cdate}")
+    log(f"    Контейнер:   major_brand={brand} {'OK' if 'qt' in brand else 'FAIL'}")
+
+    problems = []
+    for s in info.get("streams", []):
+        stags = s.get("tags", {})
+        if s.get("codec_type") == "video":
+            cs = s.get("color_space", "")
+            ct = s.get("color_transfer", "")
+            cp = s.get("color_primaries", "")
+            cr = s.get("color_range", "")
+            hn = stags.get("handler_name", "")
+            vid = stags.get("vendor_id", "")
+            enc = stags.get("encoder", "")
+            log(f"    Видео:       color={cs}/{ct}/{cp} range={cr}")
+            log(f"    Handler:     {hn}  vendor={vid}  encoder={enc}")
+            if "FFMP" in vid:
+                problems.append("vendor_id=FFMP")
+            if "Lavc" in enc or "Lavf" in enc:
+                problems.append(f"encoder={enc}")
+            if ct not in ("bt709",):
+                problems.append(f"color_trc={ct or 'missing'}")
+        elif s.get("codec_type") == "audio":
+            sr = s.get("sample_rate", "")
+            hn = stags.get("handler_name", "")
+            log(f"    Аудио:       {sr}Hz  handler={hn}")
+
+    if problems:
+        log(f"    ПРОБЛЕМЫ: {', '.join(problems)}")
+    else:
+        log("    ЧИСТО — никаких маркеров ffmpeg")
 
 
 def main():
