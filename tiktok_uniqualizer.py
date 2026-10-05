@@ -30,33 +30,36 @@ SUPPORTED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 
 # --- Video encoding ---
 HFLIP = True                       # Horizontal mirror -- ALWAYS ON
-CRF = 18                          # Quality (18 = visually lossless)
+CRF = 17                          # Quality (17 = near-lossless, max quality)
 PRESET = "slow"                   # x264 preset (slow = good compression)
 VIDEO_PROFILE = "high"            # H.264 profile
 VIDEO_LEVEL = "4.0"               # H.264 level
 GOP_SIZE = 30                     # Keyframe interval (1 sec at 30fps)
-SPEED_FACTOR = 1.008              # Playback speed multiplier (0.8% faster)
+SPEED_FACTOR = 1.025              # Playback speed multiplier (2.5% faster)
+
+# --- Fixed seed for identical processing across all videos ---
+FIXED_PROCESSING_SEED = 0xDEAD_BEEF  # Same filters for every video, every run
 
 # --- Per-channel color grading (gamma) ---
-GAMMA_R = 1.03                    # Warm reds slightly
-GAMMA_G = 1.01                    # Near neutral greens
-GAMMA_B = 0.98                    # Cool blues slightly
+GAMMA_R = 1.07                    # Warm reds aggressively
+GAMMA_G = 1.02                    # Slight green lift
+GAMMA_B = 0.94                    # Cool blues aggressively
 
 # --- Visual effects ---
-FADE_FRAMES = 20                  # Frames for fade-in / fade-out
-VIGNETTE_STRENGTH = 0.08          # Corner darkening intensity
-GRAIN_STRENGTH = 1.2              # Film grain sigma per frame
-LF_PATTERN_AMPLITUDE = 1.5       # Low-freq luminance pattern peak value
-LF_PATTERN_TEMPORAL_SPEED = 0.02  # Temporal drift rate of pattern
+FADE_FRAMES = 35                  # Frames for fade-in / fade-out
+VIGNETTE_STRENGTH = 0.15          # Corner darkening intensity (max before visible)
+GRAIN_STRENGTH = 2.8              # Film grain sigma (max before noticeable)
+LF_PATTERN_AMPLITUDE = 3.5       # Low-freq luminance pattern (max before visible)
+LF_PATTERN_TEMPORAL_SPEED = 0.05  # Temporal drift rate of pattern
 
 # --- Audio processing ---
 AUDIO_SAMPLE_RATE = 48000         # iPhone records at 48 kHz
 AUDIO_BITRATE = "192k"            # AAC output bitrate
-AUDIO_PHASE_PERTURBATION = 0.15   # STFT phase noise amplitude (radians)
-AUDIO_STFT_NOISE_FACTOR = 0.003   # Spectral noise relative to mean magnitude
+AUDIO_PHASE_PERTURBATION = 0.35   # STFT phase noise amplitude (radians, max)
+AUDIO_STFT_NOISE_FACTOR = 0.008   # Spectral noise relative to mean magnitude
 AUDIO_MICRO_ECHO_DELAY_MS = 7     # Micro-echo delay (ms)
-AUDIO_MICRO_ECHO_DECAY = 0.06     # Micro-echo amplitude
-AUDIO_HARMONIC_STRENGTH = 0.003   # Second-harmonic injection level
+AUDIO_MICRO_ECHO_DECAY = 0.14     # Micro-echo amplitude (max before audible)
+AUDIO_HARMONIC_STRENGTH = 0.008   # Second-harmonic injection level
 
 # --- iPhone device metadata ---
 DEVICE_MAKE = "Apple"
@@ -809,11 +812,10 @@ def process_video(input_path, output_path):
     """
     log(f"Processing: {input_path}")
 
-    # --- Deterministic seed ---
+    # --- Fixed seed: identical processing for every video ---
     file_hash = sha256_file(input_path)
-    seed = get_seed(file_hash)
-    rng = np.random.default_rng(seed)
-    log(f"  Hash: {file_hash[:16]}...  Seed: {seed}")
+    rng = np.random.default_rng(FIXED_PROCESSING_SEED)
+    log(f"  Hash: {file_hash[:16]}...  Seed: {FIXED_PROCESSING_SEED:#x} (fixed)")
 
     # --- Probe input ---
     info = get_video_info(input_path)
@@ -893,7 +895,7 @@ def process_video(input_path, output_path):
     if has_audio:
         has_audio = _extract_audio(input_path, temp_audio_in)
         if has_audio:
-            audio_rng = np.random.default_rng(int(rng.integers(0, 2**31)))
+            audio_rng = np.random.default_rng(FIXED_PROCESSING_SEED + 1)
             process_audio(temp_audio_in, temp_audio_out, audio_rng)
 
     # --- Build ffmpeg DECODE command ---
