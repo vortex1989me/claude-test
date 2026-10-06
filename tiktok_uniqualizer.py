@@ -6,8 +6,8 @@ Structural modification approach to bypass content-level detection.
 
 Processing pipeline:
   - HFLIP (horizontal mirror)
+  - Asymmetric crop + scale back (changes PDQ hash composition)
   - Ken Burns virtual camera (zoom + pan, breaks TMK+PDQF temporal hash)
-  - Scene shuffling + cross-fade transitions (breaks temporal fingerprint)
   - iPhone metadata spoofing (QuickTime container, Apple metadata, bt709 color)
   - Binary MOV patching (ftyp, hdlr, stco/co64, ffmpeg marker scrub)
 """
@@ -35,6 +35,12 @@ SPEED_FACTOR = 1.04
 # --- Fixed seed for deterministic processing ---
 FIXED_PROCESSING_SEED = 0xDEAD_BEEF
 
+# --- Asymmetric crop (changes PDQ hash composition) ---
+CROP_LEFT = 0.15      # 15% from left
+CROP_RIGHT = 0.10     # 10% from right
+CROP_TOP = 0.12       # 12% from top
+CROP_BOTTOM = 0.08    # 8% from bottom
+
 # --- Ken Burns virtual camera (slow zoom + pan) ---
 KB_ZOOM_START = 1.05   # 5% zoom at video start
 KB_ZOOM_END = 1.12     # 12% zoom at video end
@@ -42,13 +48,6 @@ KB_PAN_X_START = 0.30  # pan start X (fraction of max offset)
 KB_PAN_X_END = 0.70    # pan end X
 KB_PAN_Y_START = 0.25  # pan start Y
 KB_PAN_Y_END = 0.75    # pan end Y
-
-# --- Scene shuffling ---
-SCENE_THRESHOLD = 0.35     # histogram L1 diff for scene boundary
-MIN_SCENE_FRAMES = 15      # minimum frames per scene segment
-MIN_SEGMENTS = 3           # force-split if fewer scenes detected
-FALLBACK_CHUNK_SEC = 3.0   # chunk size when force-splitting
-TRANSITION_SEC = 0.4       # cross-fade duration between shuffled scenes
 
 # --- Audio ---
 AUDIO_SAMPLE_RATE = 48000
@@ -581,23 +580,30 @@ def _write_wav(filepath, data, sample_rate, channels=2):
         f.write(data.astype(np.int16).tobytes())
 
 
-def _speed_change_audio(data, sr, channels):
-    if SPEED_FACTOR == 1.0:
-        return data
-    fdata = data.astype(np.float64) / 32768.0
-    old_len = fdata.shape[0]
-    new_len = int(old_len / SPEED_FACTOR)
-    old_x = np.linspace(0, 1, old_len)
-    new_x = np.linspace(0, 1, new_len)
-    if fdata.ndim == 2:
-        new_data = np.zeros((new_len, channels), dtype=np.float64)
-        for ch in range(channels):
-            new_data[:, ch] = np.interp(new_x, old_x, fdata[:, ch])
-        fdata = new_data
+def process_audio(input_wav, output_wav):
+    log("  Processing audio (speed change)...")
+    data, sr, channels = _read_wav(input_wav)
+
+    if SPEED_FACTOR != 1.0:
+        fdata = data.astype(np.float64) / 32768.0
+        old_len = fdata.shape[0]
+        new_len = int(old_len / SPEED_FACTOR)
+        old_x = np.linspace(0, 1, old_len)
+        new_x = np.linspace(0, 1, new_len)
+        if fdata.ndim == 2:
+            new_data = np.zeros((new_len, channels), dtype=np.float64)
+            for ch in range(channels):
+                new_data[:, ch] = np.interp(new_x, old_x, fdata[:, ch])
+            fdata = new_data
+        else:
+            fdata = np.interp(new_x, old_x, fdata)
+        fdata = np.clip(fdata, -1.0, 1.0)
+        int_data = (fdata * 32767).astype(np.int16)
     else:
-        fdata = np.interp(new_x, old_x, fdata)
-    fdata = np.clip(fdata, -1.0, 1.0)
-    return (fdata * 32767).astype(np.int16)
+        int_data = data
+
+    _write_wav(output_wav, int_data, sr, channels)
+    log("    Audio done")
 
 
 # ============================================================
@@ -606,15 +612,22 @@ def _speed_change_audio(data, sr, channels):
 
 
 def process_frame(frame, frame_idx, total_frames, display_w, display_h):
-    """HFLIP + Ken Burns zoom/pan + resize."""
+    """HFLIP + asymmetric crop + Ken Burns zoom/pan + resize."""
     h, w = frame.shape[:2]
 
     # 1. Horizontal flip
     if HFLIP:
         frame = np.ascontiguousarray(frame[:, ::-1, :])
 
-    # 2. Ken Burns (zoom + pan interpolated over video duration)
-    ch, cw = h, w
+    # 2. Asymmetric crop
+    x1 = int(w * CROP_LEFT)
+    x2 = int(w * (1 - CROP_RIGHT))
+    y1 = int(h * CROP_TOP)
+    y2 = int(h * (1 - CROP_BOTTOM))
+    frame = frame[y1:y2, x1:x2]
+
+    # 3. Ken Burns (zoom + pan interpolated over video duration)
+    ch, cw = frame.shape[:2]
     t = frame_idx / max(total_frames - 1, 1)
 
     zoom = KB_ZOOM_START + (KB_ZOOM_END - KB_ZOOM_START) * t
@@ -630,86 +643,11 @@ def process_frame(frame, frame_idx, total_frames, display_w, display_h):
 
     frame = frame[cy:cy + crop_h, cx:cx + crop_w]
 
-    # 3. Resize to target dimensions
+    # 4. Resize to target dimensions
     frame = cv2.resize(frame, (display_w, display_h),
                        interpolation=cv2.INTER_LANCZOS4)
 
     return frame
-
-
-def compute_histogram(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
-    total = hist.sum()
-    if total > 0:
-        hist /= total
-    return hist.flatten()
-
-
-# ============================================================
-# SCENE DETECTION + SHUFFLING
-# ============================================================
-
-
-def detect_scenes(histograms, fps):
-    n = len(histograms)
-    if n == 0:
-        return [(0, 0)]
-
-    boundaries = [0]
-    for i in range(1, n):
-        diff = np.sum(np.abs(histograms[i] - histograms[i - 1]))
-        if diff > SCENE_THRESHOLD and (i - boundaries[-1]) >= MIN_SCENE_FRAMES:
-            boundaries.append(i)
-    boundaries.append(n)
-
-    segments = [(boundaries[i], boundaries[i + 1])
-                for i in range(len(boundaries) - 1)]
-
-    if len(segments) < MIN_SEGMENTS:
-        chunk = max(MIN_SCENE_FRAMES, int(FALLBACK_CHUNK_SEC * fps))
-        segments = []
-        pos = 0
-        while pos < n:
-            end = min(pos + chunk, n)
-            if n - end < MIN_SCENE_FRAMES and end < n:
-                end = n
-            segments.append((pos, end))
-            pos = end
-
-    return segments
-
-
-def shuffle_audio_segments(audio_int, original_segments, shuffle_order,
-                           out_fps, sr, transition_sec):
-    total_audio = audio_int.shape[0]
-
-    audio_segs = []
-    for start_f, end_f in original_segments:
-        s0 = min(int(start_f * sr / out_fps), total_audio)
-        s1 = min(int(end_f * sr / out_fps), total_audio)
-        audio_segs.append(audio_int[s0:s1])
-
-    shuffled = [audio_segs[i] for i in shuffle_order]
-
-    transition_samples = int(transition_sec * sr)
-    parts = []
-    for i, seg in enumerate(shuffled):
-        parts.append(seg)
-        if i < len(shuffled) - 1 and transition_samples > 0:
-            tail_len = min(transition_samples, len(seg))
-            head_len = min(transition_samples, len(shuffled[i + 1]))
-            fade_len = min(tail_len, head_len)
-            if fade_len > 0:
-                tail = seg[-fade_len:].astype(np.float64)
-                head = shuffled[i + 1][:fade_len].astype(np.float64)
-                alpha = np.linspace(0, 1, fade_len)
-                if tail.ndim == 2:
-                    alpha = alpha[:, np.newaxis]
-                xfade = (tail * (1 - alpha) + head * alpha).astype(np.int16)
-                parts.append(xfade)
-
-    return np.concatenate(parts)
 
 
 # ============================================================
@@ -721,7 +659,6 @@ def process_video(input_path, output_path):
     log(f"Processing: {input_path}")
 
     file_hash = sha256_file(input_path)
-    rng = np.random.default_rng(FIXED_PROCESSING_SEED)
     log(f"  Hash: {file_hash[:16]}...  Seed: {FIXED_PROCESSING_SEED:#x} (fixed)")
 
     info = get_video_info(input_path)
@@ -790,10 +727,10 @@ def process_video(input_path, output_path):
     has_audio = a_stream is not None
     if has_audio:
         has_audio = _extract_audio(input_path, temp_audio_in)
+        if has_audio:
+            process_audio(temp_audio_in, temp_audio_out)
 
-    # ---- PHASE 1: Decode + transform + scene detection ----
-    log("  Phase 1: Decode, transform, detect scenes...")
-
+    # --- DECODE command ---
     decode_vf = []
     if rotation in (90, -270):
         decode_vf.append("transpose=2")
@@ -812,90 +749,7 @@ def process_video(input_path, output_path):
         "pipe:1",
     ]
 
-    frame_size = display_w * display_h * 3
-    decode_proc = subprocess.Popen(
-        decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    )
-
-    frame_data = []
-    histograms = []
-    progress_step = max(1, total_frames // 10)
-    frame_idx = 0
-
-    while True:
-        raw = decode_proc.stdout.read(frame_size)
-        if len(raw) < frame_size:
-            break
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape(
-            display_h, display_w, 3
-        )
-        processed = process_frame(
-            frame, frame_idx, total_frames, display_w, display_h
-        )
-
-        _, buf = cv2.imencode(
-            ".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, 97]
-        )
-        frame_data.append(buf.tobytes())
-
-        histograms.append(compute_histogram(processed))
-
-        frame_idx += 1
-        if frame_idx % progress_step == 0:
-            pct = int(frame_idx / total_frames * 100)
-            log(f"    Decode: {pct}%")
-
-    decode_proc.wait(timeout=30)
-    actual_frames = len(frame_data)
-    log(f"    Decoded {actual_frames} frames "
-        f"(~{sum(len(f) for f in frame_data) / 1048576:.0f} MB compressed)")
-
-    if actual_frames == 0:
-        log("  ERROR: no frames decoded")
-        return False
-
-    # ---- PHASE 2: Scene detection + shuffle ----
-    log("  Phase 2: Scene detection + shuffle...")
-
-    original_segments = detect_scenes(histograms, fps)
-    log(f"    Detected {len(original_segments)} segments")
-
-    shuffle_order = list(range(len(original_segments)))
-    if len(shuffle_order) > 1:
-        rng.shuffle(shuffle_order)
-    shuffled_segments = [original_segments[i] for i in shuffle_order]
-
-    transition_frames = int(TRANSITION_SEC * out_fps)
-    num_transitions = max(0, len(shuffled_segments) - 1)
-    total_output_frames = (
-        sum(e - s for s, e in shuffled_segments)
-        + num_transitions * transition_frames
-    )
-
-    for i, (s, e) in enumerate(shuffled_segments):
-        orig_idx = shuffle_order[i]
-        log(f"    [{i}] orig#{orig_idx} frames [{s}:{e}] ({e - s} fr)")
-    log(f"    Transitions: {num_transitions} x {transition_frames}fr "
-        f"({TRANSITION_SEC}s)")
-    log(f"    Total output: {total_output_frames} frames")
-
-    # ---- PHASE 2b: Audio ----
-    if has_audio:
-        log("  Processing audio...")
-        audio_data, sr, channels = _read_wav(temp_audio_in)
-        audio_int = _speed_change_audio(audio_data, sr, channels)
-
-        audio_shuffled = shuffle_audio_segments(
-            audio_int, original_segments, shuffle_order,
-            out_fps, sr, TRANSITION_SEC,
-        )
-        _write_wav(temp_audio_out, audio_shuffled, sr, channels)
-        log(f"    Audio: {audio_int.shape[0]} -> {audio_shuffled.shape[0]} "
-            f"samples")
-
-    # ---- PHASE 3: Encode ----
-    log("  Phase 3: Encode...")
-
+    # --- ENCODE command ---
     encode_cmd = [
         "ffmpeg", "-y", "-nostdin",
         "-f", "rawvideo",
@@ -954,6 +808,15 @@ def process_video(input_path, output_path):
         output_path,
     ])
 
+    # --- Pipeline ---
+    log("  Starting pipe-based encode...")
+    frame_size = display_w * display_h * 3
+
+    decode_proc = subprocess.Popen(
+        decode_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
     encode_proc = subprocess.Popen(
         encode_cmd,
         stdin=subprocess.PIPE,
@@ -973,47 +836,36 @@ def process_video(input_path, output_path):
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
     stderr_thread.start()
 
-    frame_count = 0
+    progress_step = max(1, total_frames // 10)
+    frame_idx = 0
     try:
-        for seg_idx, (start, end) in enumerate(shuffled_segments):
-            for fidx in range(start, end):
-                frame = cv2.imdecode(
-                    np.frombuffer(frame_data[fidx], np.uint8),
-                    cv2.IMREAD_COLOR,
-                )
-                encode_proc.stdin.write(frame.tobytes())
-                frame_count += 1
-
-            if seg_idx < len(shuffled_segments) - 1 and transition_frames > 0:
-                last_frame = cv2.imdecode(
-                    np.frombuffer(frame_data[end - 1], np.uint8),
-                    cv2.IMREAD_COLOR,
-                ).astype(np.float32)
-                next_start = shuffled_segments[seg_idx + 1][0]
-                first_frame = cv2.imdecode(
-                    np.frombuffer(frame_data[next_start], np.uint8),
-                    cv2.IMREAD_COLOR,
-                ).astype(np.float32)
-
-                for t in range(transition_frames):
-                    alpha = (t + 1) / (transition_frames + 1)
-                    blended = (
-                        last_frame * (1 - alpha) + first_frame * alpha
-                    ).astype(np.uint8)
-                    encode_proc.stdin.write(blended.tobytes())
-                    frame_count += 1
-
-            log(f"    Segment {seg_idx + 1}/{len(shuffled_segments)} done")
+        while True:
+            raw = decode_proc.stdout.read(frame_size)
+            if len(raw) < frame_size:
+                break
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                display_h, display_w, 3
+            )
+            processed = process_frame(
+                frame, frame_idx, total_frames, display_w, display_h
+            )
+            encode_proc.stdin.write(processed.tobytes())
+            frame_idx += 1
+            if frame_idx % progress_step == 0:
+                pct = int(frame_idx / total_frames * 100)
+                log(f"    Progress: {pct}%")
 
         encode_proc.stdin.close()
         encode_proc.wait(timeout=300)
         stderr_thread.join(timeout=10)
+        decode_proc.wait(timeout=30)
 
     except Exception as exc:
+        decode_proc.kill()
         encode_proc.kill()
-        raise RuntimeError(f"Encode pipe error: {exc}") from exc
+        raise RuntimeError(f"Pipe error: {exc}") from exc
 
-    log(f"  Encoded {frame_count} frames")
+    log(f"  Encoded {frame_idx} frames")
 
     if encode_proc.returncode != 0:
         err_msg = (b"".join(enc_stderr_chunks)
@@ -1025,8 +877,6 @@ def process_video(input_path, output_path):
     patch_mov_file(output_path, apple_date, utc_date)
 
     # --- Cleanup ---
-    del frame_data
-    del histograms
     for tmp in (temp_audio_in, temp_audio_out):
         if os.path.isfile(tmp):
             os.remove(tmp)
@@ -1174,13 +1024,12 @@ def verify_metadata(filepath):
 def main():
     log("TikTok Video Uniqualizer v8 -- Structural Modification")
     log("=" * 60)
-    log("Transforms: HFLIP + ken_burns + scene_shuffle")
+    log("Transforms: HFLIP + asymmetric_crop + ken_burns")
+    log(f"  crop:      L={CROP_LEFT:.0%} R={CROP_RIGHT:.0%} "
+        f"T={CROP_TOP:.0%} B={CROP_BOTTOM:.0%}")
     log(f"  ken_burns: zoom {KB_ZOOM_START:.2f}->{KB_ZOOM_END:.2f}  "
         f"pan ({KB_PAN_X_START:.2f},{KB_PAN_Y_START:.2f})"
         f"->({KB_PAN_X_END:.2f},{KB_PAN_Y_END:.2f})")
-    log(f"  scenes:    threshold={SCENE_THRESHOLD}  "
-        f"min_frames={MIN_SCENE_FRAMES}  "
-        f"transition={TRANSITION_SEC}s")
     log(f"  speed:     {SPEED_FACTOR}x")
     log(f"  seed:      {FIXED_PROCESSING_SEED:#x} (fixed)")
     log("")
