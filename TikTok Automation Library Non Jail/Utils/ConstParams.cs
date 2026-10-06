@@ -9,6 +9,6 @@ namespace TikTok_Automation_Library_Non_Jail.Utils
 		public static Random rand = new Random(DateTime.Now.Millisecond);
 
 		// Token: 0x0400045D RID: 1117
-		public static readonly string CONST_PASSWORD = "QoaSFD21Qaz3!#";
+		public static readonly string CONST_PASSWORD = "YOUR_TIKTOK_PASSWORD";
 	}
 }

@@ -206,7 +206,7 @@ namespace TikTok_Automation_Library_Non_Jail.Properties
 		// (set) Token: 0x060001B1 RID: 433 RVA: 0x00002A7C File Offset: 0x00000C7C
 		[UserScopedSetting]
 		[DebuggerNonUserCode]
-		[DefaultSettingValue("OW 5Gz")]
+		[DefaultSettingValue("YOUR_WIFI_NAME")]
 		public string WifiName
 		{
 			get
@@ -224,7 +224,7 @@ namespace TikTok_Automation_Library_Non_Jail.Properties
 		// (set) Token: 0x060001B3 RID: 435 RVA: 0x00002A9C File Offset: 0x00000C9C
 		[UserScopedSetting]
 		[DebuggerNonUserCode]
-		[DefaultSettingValue("Ki4eje7eb9")]
+		[DefaultSettingValue("YOUR_WIFI_PASSWORD")]
 		public string WifiPassword
 		{
 			get
@@ -746,7 +746,7 @@ namespace TikTok_Automation_Library_Non_Jail.Properties
 		// (set) Token: 0x060001ED RID: 493 RVA: 0x00002EC3 File Offset: 0x000010C3
 		[UserScopedSetting]
 		[DebuggerNonUserCode]
-		[DefaultSettingValue("JIFybIs4L7BudOdur1B8FYV9x2X0nEZO")]
+		[DefaultSettingValue("YOUR_ANYMESSAGE_API_KEY")]
 		public string AnyMessageApiKey
 		{
 			get
@@ -764,7 +764,7 @@ namespace TikTok_Automation_Library_Non_Jail.Properties
 		// (set) Token: 0x060001EF RID: 495 RVA: 0x00002EE3 File Offset: 0x000010E3
 		[UserScopedSetting]
 		[DebuggerNonUserCode]
-		[DefaultSettingValue("p5069516:onr9b9KJjB")]
+		[DefaultSettingValue("YOUR_PIA_LOGIN:YOUR_PIA_PASSWORD")]
 		public string PiaData
 		{
 			get
