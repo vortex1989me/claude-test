@@ -6,7 +6,6 @@ Structural modification approach to bypass content-level detection.
 
 Processing pipeline:
   - HFLIP (horizontal mirror)
-  - Asymmetric crop 12-15% + scale back (changes PDQ hash composition)
   - Ken Burns virtual camera (zoom + pan, breaks TMK+PDQF temporal hash)
   - Scene shuffling + cross-fade transitions (breaks temporal fingerprint)
   - iPhone metadata spoofing (QuickTime container, Apple metadata, bt709 color)
@@ -35,12 +34,6 @@ SPEED_FACTOR = 1.04
 
 # --- Fixed seed for deterministic processing ---
 FIXED_PROCESSING_SEED = 0xDEAD_BEEF
-
-# --- Asymmetric crop (changes PDQ hash composition) ---
-CROP_LEFT = 0.15      # 15% from left
-CROP_RIGHT = 0.10     # 10% from right
-CROP_TOP = 0.12       # 12% from top
-CROP_BOTTOM = 0.08    # 8% from bottom
 
 # --- Ken Burns virtual camera (slow zoom + pan) ---
 KB_ZOOM_START = 1.05   # 5% zoom at video start
@@ -613,22 +606,15 @@ def _speed_change_audio(data, sr, channels):
 
 
 def process_frame(frame, frame_idx, total_frames, display_w, display_h):
-    """HFLIP + asymmetric crop + Ken Burns zoom/pan + resize."""
+    """HFLIP + Ken Burns zoom/pan + resize."""
     h, w = frame.shape[:2]
 
     # 1. Horizontal flip
     if HFLIP:
         frame = np.ascontiguousarray(frame[:, ::-1, :])
 
-    # 2. Asymmetric crop
-    x1 = int(w * CROP_LEFT)
-    x2 = int(w * (1 - CROP_RIGHT))
-    y1 = int(h * CROP_TOP)
-    y2 = int(h * (1 - CROP_BOTTOM))
-    frame = frame[y1:y2, x1:x2]
-
-    # 3. Ken Burns (zoom + pan interpolated over video duration)
-    ch, cw = frame.shape[:2]
+    # 2. Ken Burns (zoom + pan interpolated over video duration)
+    ch, cw = h, w
     t = frame_idx / max(total_frames - 1, 1)
 
     zoom = KB_ZOOM_START + (KB_ZOOM_END - KB_ZOOM_START) * t
@@ -644,7 +630,7 @@ def process_frame(frame, frame_idx, total_frames, display_w, display_h):
 
     frame = frame[cy:cy + crop_h, cx:cx + crop_w]
 
-    # 4. Resize to target dimensions
+    # 3. Resize to target dimensions
     frame = cv2.resize(frame, (display_w, display_h),
                        interpolation=cv2.INTER_LANCZOS4)
 
@@ -1188,9 +1174,7 @@ def verify_metadata(filepath):
 def main():
     log("TikTok Video Uniqualizer v8 -- Structural Modification")
     log("=" * 60)
-    log("Transforms: HFLIP + asymmetric_crop + ken_burns + scene_shuffle")
-    log(f"  crop:      L={CROP_LEFT:.0%} R={CROP_RIGHT:.0%} "
-        f"T={CROP_TOP:.0%} B={CROP_BOTTOM:.0%}")
+    log("Transforms: HFLIP + ken_burns + scene_shuffle")
     log(f"  ken_burns: zoom {KB_ZOOM_START:.2f}->{KB_ZOOM_END:.2f}  "
         f"pan ({KB_PAN_X_START:.2f},{KB_PAN_Y_START:.2f})"
         f"->({KB_PAN_X_END:.2f},{KB_PAN_Y_END:.2f})")
