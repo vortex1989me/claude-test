@@ -129,11 +129,22 @@ def name_for(link, idx):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--proxy", action="store_true", help="качать видео через прокси из proxy.txt")
+    ap.add_argument("--no-proxy", action="store_true", help="не использовать прокси (без вопроса)")
     ap.add_argument("--api-proxy", action="store_true", help="запросы к API тоже через прокси")
     ap.add_argument("--threads", type=int, default=3)
     a = ap.parse_args()
 
     load_config()
+    if not a.proxy and not a.no_proxy:
+        print("Режим работы:")
+        print("  1 - без прокси")
+        print("  2 - через прокси (только скачивание видео)")
+        print("  3 - через прокси (и запросы к API, и скачивание)")
+        choice = input("Выберите 1, 2 или 3: ").strip()
+        if choice in ("2", "3"):
+            a.proxy = True
+        if choice == "3":
+            a.api_proxy = True
     links = load_lines(LINKS_FILE)
     if not links:
         sys.exit(f"{LINKS_FILE} пуст")
