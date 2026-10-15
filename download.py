@@ -18,7 +18,7 @@ API_KEY = os.environ.get("RAPIDAPI_KEY", "ВСТАВЬТЕ_КЛЮЧ")
 API_HOST = "tiktok-video-downloader-api.p.rapidapi.com"  # x-rapidapi-host
 API_PATH = "/"                                           # путь эндпоинта, напр. "/media"
 API_METHOD = "GET"
-URL_PARAM = "url"                                        # имя параметра со ссылкой
+URL_PARAM = "videoUrl"                                   # имя параметра со ссылкой (по скриншоту)
 # =================================================================================
 
 BASE = os.path.dirname(os.path.abspath(__file__))  # папка, где лежит скрипт
@@ -52,7 +52,7 @@ def proxies_dict(purl):
 
 def find_video_url(data):
     """Ищет в JSON прямую ссылку на видео: сначала по типичным ключам, потом любой .mp4/video URL."""
-    preferred = ("nowm", "no_watermark", "play", "download", "video", "url", "hdplay", "hd")
+    preferred = ("downloadurl", "nowm", "no_watermark", "play", "download", "video", "url", "hdplay", "hd")
     urls = []
 
     def walk(o, key=""):
