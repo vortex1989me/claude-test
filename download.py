@@ -13,19 +13,39 @@ import argparse, itertools, os, re, sys, threading
 from concurrent.futures import ThreadPoolExecutor
 import requests
 
-# ===== НАСТРОЙКИ (сверьте с вкладкой Endpoints -> Code Snippets на RapidAPI) =====
-API_KEY = os.environ.get("RAPIDAPI_KEY", "ВСТАВЬТЕ_КЛЮЧ")
-API_HOST = "tiktok-video-downloader-api.p.rapidapi.com"  # x-rapidapi-host
-API_PATH = "/"                                           # путь эндпоинта, напр. "/media"
+# ===== НАСТРОЙКИ: при первом запуске скрипт сам спросит и сохранит в config.json =====
 API_METHOD = "GET"
-URL_PARAM = "videoUrl"                                   # имя параметра со ссылкой (по скриншоту)
-# =================================================================================
+URL_PARAM = "videoUrl"  # имя параметра со ссылкой
+CONFIG = {}
+# =====================================================================================
 
 BASE = os.path.dirname(os.path.abspath(__file__))  # папка, где лежит скрипт
 OUT_DIR = os.path.join(BASE, "tiktok_downloads")
 LINKS_FILE = os.path.join(BASE, "links.txt")
 PROXY_FILE = os.path.join(BASE, "proxy.txt")
 lock = threading.Lock()
+
+
+def load_config():
+    """Читает config.json; чего не хватает - спрашивает у пользователя и сохраняет."""
+    import json
+    path = os.path.join(BASE, "config.json")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            CONFIG.update(json.load(f))
+    asks = [("api_key", "Вставьте ваш RapidAPI ключ (x-rapidapi-key): "),
+            ("api_host", "Вставьте x-rapidapi-host (например xxx.p.rapidapi.com): "),
+            ("api_path", "Вставьте путь эндпоинта (например /download): ")]
+    changed = False
+    for k, q in asks:
+        if not CONFIG.get(k):
+            CONFIG[k] = input(q).strip()
+            changed = True
+    if not CONFIG["api_path"].startswith("/"):
+        CONFIG["api_path"] = "/" + CONFIG["api_path"]
+    if changed:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(CONFIG, f, indent=2, ensure_ascii=False)
 
 
 def load_lines(path):
@@ -77,8 +97,8 @@ def find_video_url(data):
 
 
 def get_video_url(link, purl):
-    headers = {"x-rapidapi-key": API_KEY, "x-rapidapi-host": API_HOST}
-    url = f"https://{API_HOST}{API_PATH}"
+    headers = {"x-rapidapi-key": CONFIG["api_key"], "x-rapidapi-host": CONFIG["api_host"]}
+    url = f"https://{CONFIG['api_host']}{CONFIG['api_path']}"
     if API_METHOD == "GET":
         r = requests.get(url, headers=headers, params={URL_PARAM: link}, proxies=proxies_dict(purl), timeout=60)
     else:
@@ -113,8 +133,7 @@ def main():
     ap.add_argument("--threads", type=int, default=3)
     a = ap.parse_args()
 
-    if "ВСТАВЬТЕ" in API_KEY:
-        sys.exit("Укажите API_KEY в скрипте или переменной RAPIDAPI_KEY")
+    load_config()
     links = load_lines(LINKS_FILE)
     if not links:
         sys.exit(f"{LINKS_FILE} пуст")
